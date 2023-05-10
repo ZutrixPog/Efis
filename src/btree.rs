@@ -6,47 +6,29 @@ const BTREE_MAX_KEY_SIZE = 1000;
 const BTREE_MAX_VAL_SIZE = 3000;
 
 pub struct b_node {
-    data: &[u8]
+    data: Vec<u8>
 }
 
 impl b_node {
-    pub fn new_node(t: i32, leaf: bool) -> Rc<b_node> {
-        Rc::new(b_node {
-            nodes: Vec::with_capacity((2*t) as usize),
-            keys: Vec::with_capacity((2*t-1) as usize),
-            t,
-            n: 0,
-            leaf: false
-        })
-    }
-
-    fn insert_non_full(&mut self, k: i32) {
-        let mut i = self.n-1;
-
-        if self.leaf == true {
-            while i >= 0 && self.keys[i as usize] > k {
-                self.keys[(i+1) as usize] = self.keys[i as usize];
-                i -= 1;
-            }
-
-            self.keys[(i+1) as usize] = k;
-            self.n = self.n+1;
-        } else {
-            while i >= 0 && self.keys[i as usize] > k {
-                i -= 1;
-            }
-
-            if self.nodes[(i + 1) as usize].n == 2*self.t-1 {
-                self.split_child((i+1) as i32, Rc::clone(&self.nodes[(i+1) as usize]));
-
-                if self.keys[(i+1) as usize] < k {
-                    i += 1;
-                }
-            }
-            self.nodes[(i+1) as usize].insert_non_full(k);        
+    pub fn new_node(t: i32, leaf: bool) -> Self {
+        b_node {
+            data: Vec::new()
         }
     }
 
+    pub fn b_type(&self) -> u16 {
+        u16::from_le_bytes([self.data[0], self.data[1]])
+    }
+
+    pub fn n_keys(&self) -> u16 {
+        u16::from_le_bytes([self.data[2], self.data[3]])
+    }
+
+    pub fn set_header(&mut self, btype: u16, nkeys: u16) {
+        self.data[..2].copy_from_slice(&btype.to_le_bytes());
+        self.data[2..4].copy_from_slice(&nkeys.to_le_bytes());
+    }
+ 
     fn split_child(&mut self, i: i32, mut y: Rc<b_node>) {
         let mut z = b_node::new_node(y.t, y.leaf);
         let mutref = Rc::get_mut(&mut z).unwrap();
