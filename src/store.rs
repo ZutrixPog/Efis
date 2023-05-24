@@ -1,30 +1,23 @@
-use std::collections::{HashMap, HashSet, BinaryHeap};
 use std::time::{Instant, Duration};
 
 pub type Key = String;
 
-// TODO: refactor this
+// TODO: It's better wrap theses but since they are std data structures, They won't cause us any trouble.
 pub enum Value {
-    String,
-    Number,
-    List,
-    Set,
-    SortedSet,
+    Text(String),
+    Number(f64),
+    List(VecDeque<Value>),
+    Set(HashSet<Value>),
+    SortedSet(BTreeSet<Value>),
 }
 
-struct Item<T: Ord> {
+struct Item<T> {
     value: T,
     expiry: Option<Instant>,
 }
 
-enum DatastoreError {
-    KeyNotFound,
-    KeyExpired,
-    Other(String),
-}
-
 pub trait Datastore {
-    type Value;
+    type Type;
 
     fn set(&mut self, key: String, value: Self::Value, expire_duration: Option<Duration>) -> Result<(), DatastoreError>;
 
@@ -50,9 +43,9 @@ impl MemoryDataStore {
 }
 
 impl Datastore for MemoryDataStore {
-    type Value = String;
+    type Type = Value;
 
-    fn set(&mut self, key: String, value: Value, expiry: Option<Duration>) {
+    fn set(&mut self, key: String, value: Type, expiry: Option<Duration>) {
         let item = match expiry {
             Some(duration) => Item {
                 value,
@@ -66,7 +59,7 @@ impl Datastore for MemoryDataStore {
         self.data.insert(key, item);
     }
     
-    fn get(&self, key: &str) -> Option<&Value> {
+    fn get(&self, key: &str) -> Option<&Type> {
         if let Some(item) = self.data.get(key) {
             if let Some(expiry) = item.expiry {
                 if expiry <= Instant::now() {
@@ -80,7 +73,7 @@ impl Datastore for MemoryDataStore {
         }
     }
     
-    fn remove(&mut self, key: &str) -> Result<Value, DatastoreError> {
+    fn remove(&mut self, key: &str) -> Result<Type, DatastoreError> {
         if self.data.remove(key).is_some() {
             Ok(())
         } else {
@@ -104,64 +97,4 @@ impl Datastore for MemoryDataStore {
             Err(KeyNotFound)
         }
     }
-    
-    // fn list_add(&mut self, key: &str, value: String) -> bool {
-    //     let item = self.data.entry(key.to_string()).or_insert(Item {
-    //         value: Value::Set(HashSet::new()),
-    //         expiry: None,
-    //     });
-    //     match &mut item.value {
-    //         Value::Set(set) => set.insert(value),
-    //         _ => false,
-    //     }
-    // }
-    
-    // fn list_all(&self, key: &str) -> Option<&HashSet<String>> {
-    //     if let Some(item) = self.data.get(key) {
-    //         if let Some(expiry) = item.expiry {
-    //             if expiry <= Instant::now() {
-    //                 self.data.remove(key);
-    //                 return None;
-    //             }
-    //         }
-    //         match &item.value {
-    //             Value::Set(set) => Some(set),
-    //             _ => None,
-    //         }
-    //     } else {
-    //         None
-    //     }
-    // }
-    
-    // fn lpush(&mut self, key: &str, value: String) -> bool {
-    //     let item = self.data.entry(key.to_string()).or_insert(Item {
-    //         value: Value::List(Vec::new()),
-    //         expiry: None,
-    //     });
-    //     match &mut item.value {
-    //         Value::List(list) => {
-    //             list.insert(0, value);
-    //             true
-    //         }
-    //         _ => false,
-    //     }
-    // }
-    
-    // fn rpush(&mut self, key: &str, value: String) -> bool {
-    //     let item = self.data.entry(key.to_string()).or_insert(Item {
-    //         value: Value::List(Vec::new()),
-    //         expiry: None,
-    //     });
-    //     match &mut item.value {
-    //         Value::List(list) => {
-    //             list.push(value);
-    //             true
-    //         }
-    //         _ => false,
-    //     }
-    // }
-    
-    // fn lpop(&mut self, key: &str) -> Option<String> {
-    
-    // }
 }

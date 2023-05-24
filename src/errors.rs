@@ -1,23 +1,20 @@
 use std::error;
+use thiserror::Error;
 
-#[derive(Debug)]
-enum FsError {
-    WriteFailed
+#[derive(Error, Debug)]
+pub enum FsError {
+    #[error("couldn't write to disk")]
+    WriteFailed,
+    #[error("couldn't read from disk")]
+    ReadFailed
 }
 
-impl fmt::Display for DoubleError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            FileError::WriteFailed =>
-                write!(f, "could write data to disk"),
-        }
-    }
-}
-
-impl error::Error for DoubleError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
-            FsError::WriteFailed => None,
-        }
-    }
+#[derive(Error, Debug)]
+pub enum DatastoreError {
+    #[error("Key doesnt exists")]
+    KeyNotFound,
+    #[error("Key-value is expired")]
+    KeyExpired,
+    #[error("There is something wrong")]
+    Other(String),
 }
