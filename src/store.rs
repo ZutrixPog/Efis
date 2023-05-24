@@ -26,7 +26,7 @@ pub enum Value {
 }
 
 struct Item {
-    value: Value,
+    value: Arc<Mutex<Value>>,
     expiry: Option<Instant>,
 }
 
@@ -36,6 +36,8 @@ pub trait Datastore {
     fn set(&mut self, key: String, value: Self::Type, expire_duration: Option<Duration>) -> Result<(), DatastoreError>;
 
     fn get(&self, key: &str) -> Option<&Self::Type>;
+
+    fn modify<F>(&mut self, key: &str, modifier: F) -> Result<(), String> where F: FnOnce(&mut Value);
     
     fn remove(&mut self, key: &str) -> Result<Self::Type, DatastoreError>;
     
@@ -45,7 +47,7 @@ pub trait Datastore {
 }
 
 pub struct MemoryDataStore {
-    data: Arc<Mutex<HashMap<Key, Item>>>,
+    data: Arc<Mutex<HashMap<String, Item>>>,
 }
 
 impl MemoryDataStore {
@@ -54,74 +56,82 @@ impl MemoryDataStore {
             data: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-}
 
-impl Datastore for MemoryDataStore {
-    type Type = Value;
-
-    fn set(&mut self, key: String, value: Self::Type, expiry: Option<Duration>) -> Result<(), DatastoreError> {
-        let item = match expiry {
-            Some(duration) => Item {
-                value,
-                expiry: Some(Instant::now() + duration),
-            },
-            None => Item {
-                value,
-                expiry: None,
-            },
+    pub fn set(&mut self, key: String, value: Value, expiry: Option<Duration>) {
+        let item = Item {
+            value: Arc::new(Mutex::new(value)),
+            expiry: expiry.map(|d| Instant::now() + d),
         };
-
         let mut data = self.data.lock().unwrap();
         data.insert(key, item);
-        Ok(())
     }
 
-    fn get(&self, key: &str) -> Option<&Self::Type> {
-        let mut data = self.data.lock().unwrap();
-        if let Ok(Some(expiry)) = self.ttl(key) {
-            if expiry.is_zero() {
-                data.remove(key);
-                return None;
+    pub fn get(&self, key: &str) -> Option<Value> {
+        let data = self.data.lock().unwrap();
+        if let Some(item) = data.get(key) {
+            if let Some(expiry) = item.expiry {
+                if expiry <= Instant::now() {
+                    data.remove(key);
+                    return None;
+                }
             }
-            Some(&(data.get(key).unwrap().value.clone()))
+            Some(item.value.lock().unwrap().clone())
         } else {
             None
         }
     }
 
-    fn remove(&mut self, key: &str) -> Result<Self::Type, DatastoreError> {
+    pub fn remove(&mut self, key: &str) -> Result<(), String> {
         let mut data = self.data.lock().unwrap();
-        if let Some(item) = data.remove(key) {
-            Ok(item.value)
+        if data.remove(key).is_some() {
+            Ok(())
         } else {
-            Err(DatastoreError::Other("couldn't delete key value".to_string()))
+            Err("Key not found".to_string())
         }
     }
 
-    fn expire(&mut self, key: &str, duration: Duration) -> Result<(), DatastoreError> {
+    pub fn expire(&mut self, key: &str, duration: Duration) -> Result<(), String> {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get_mut(key) {
             item.expiry = Some(Instant::now() + duration);
             Ok(())
         } else {
-            Err(DatastoreError::KeyNotFound)
+            Err("Key not found".to_string())
         }
     }
 
-    fn ttl(&self, key: &str) -> Result<Option<Duration>, DatastoreError> {
+    pub fn ttl(&self, key: &str) -> Result<Option<Duration>, String> {
         let data = self.data.lock().unwrap();
         if let Some(item) = data.get(key) {
-            if let Some(exp) = item.expiry {
-                Ok(Some(exp - Instant::now()))
+            if let Some(expiry) = item.expiry {
+                let now = Instant::now();
+                if now >= expiry {
+                    data.remove(key);
+                    return Ok(None);
+                }
+                Ok(Some(expiry - now))
             } else {
                 Ok(None)
             }
         } else {
-            Err(DatastoreError::KeyNotFound)
+            Err("Key not found".to_string())
+        }
+    }
+
+    pub fn modify<F>(&mut self, key: &str, modifier: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut Value),
+    {
+        let mut data = self.data.lock().unwrap();
+        if let Some(item) = data.get_mut(key) {
+            let value = Arc::get_mut(&mut item.value).ok_or("Concurrent access error")?;
+            modifier(value);
+            Ok(())
+        } else {
+            Err("Key not found".to_string())
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
