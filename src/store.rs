@@ -1,11 +1,12 @@
 use std::time::{Instant, Duration};
 use std::sync::{Arc, Mutex};
-use std::collections::{VecDeque, HashSet, BTreeSet, HashMap};
+use std::collections::{VecDeque, HashSet, BTreeMap, HashMap};
+use std::cmp::PartialEq;
 use thiserror::Error; // 1.0.40
 
 pub type Key = String;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq)]
 pub enum DatastoreError {
     #[error("Key doesnt exists")]
     KeyNotFound,
@@ -15,14 +16,12 @@ pub enum DatastoreError {
     Other(String),
 }
 
-// TODO: It's better wrap theses but since they are std data structures, They won't cause us any trouble.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Text(String),
-    Number(f64),
-    List(VecDeque<Value>),
-    Set(HashSet<Value>),
-    SortedSet(BTreeSet<Value>),
+    List(VecDeque<String>),
+    Set(HashSet<String>),
+    SortedSet(BTreeMap<i64, String>),
 }
 
 struct Item {
@@ -35,11 +34,11 @@ pub trait Datastore {
 
     fn set(&mut self, key: String, value: Self::Type, expire_duration: Option<Duration>) -> Result<(), DatastoreError>;
 
-    fn get(&self, key: &str) -> Option<&Self::Type>;
+    fn get(&self, key: &str) -> Option<Self::Type>;
 
-    fn modify<F>(&mut self, key: &str, modifier: F) -> Result<(), String> where F: FnOnce(&mut Value);
+    fn modify<F>(&mut self, key: &str, modifier: F) -> Result<(), DatastoreError> where F: FnOnce(&mut Self::Type);
     
-    fn remove(&mut self, key: &str) -> Result<Self::Type, DatastoreError>;
+    fn remove(&mut self, key: &str) -> Result<(), DatastoreError>;
     
     fn expire(&mut self, key: &str, expire_duration: Duration) -> Result<(), DatastoreError>;
     
@@ -56,18 +55,23 @@ impl MemoryDataStore {
             data: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
 
-    pub fn set(&mut self, key: String, value: Value, expiry: Option<Duration>) {
+impl Datastore for MemoryDataStore {
+    type Type = Value;    
+
+    fn set(&mut self, key: String, value: Self::Type, expiry: Option<Duration>) -> Result<(), DatastoreError> {
         let item = Item {
             value: Arc::new(Mutex::new(value)),
             expiry: expiry.map(|d| Instant::now() + d),
         };
         let mut data = self.data.lock().unwrap();
         data.insert(key, item);
+        Ok(())
     }
 
-    pub fn get(&self, key: &str) -> Option<Value> {
-        let data = self.data.lock().unwrap();
+    fn get(&self, key: &str) -> Option<Self::Type> {
+        let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get(key) {
             if let Some(expiry) = item.expiry {
                 if expiry <= Instant::now() {
@@ -75,60 +79,61 @@ impl MemoryDataStore {
                     return None;
                 }
             }
-            Some(item.value.lock().unwrap().clone())
+            
+            Some((*item.value.lock().unwrap()).clone())
         } else {
             None
         }
     }
 
-    pub fn remove(&mut self, key: &str) -> Result<(), String> {
+    fn remove(&mut self, key: &str) -> Result<(), DatastoreError> {
         let mut data = self.data.lock().unwrap();
         if data.remove(key).is_some() {
             Ok(())
         } else {
-            Err("Key not found".to_string())
+            Err(DatastoreError::KeyNotFound)
         }
     }
 
-    pub fn expire(&mut self, key: &str, duration: Duration) -> Result<(), String> {
+    fn expire(&mut self, key: &str, duration: Duration) -> Result<(), DatastoreError> {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get_mut(key) {
             item.expiry = Some(Instant::now() + duration);
             Ok(())
         } else {
-            Err("Key not found".to_string())
+            Err(DatastoreError::KeyNotFound)
         }
     }
 
-    pub fn ttl(&self, key: &str) -> Result<Option<Duration>, String> {
-        let data = self.data.lock().unwrap();
+    fn ttl(&self, key: &str) -> Result<Option<Duration>, DatastoreError> {
+        let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get(key) {
             if let Some(expiry) = item.expiry {
                 let now = Instant::now();
                 if now >= expiry {
                     data.remove(key);
-                    return Ok(None);
+                    return Err(DatastoreError::KeyExpired);
                 }
                 Ok(Some(expiry - now))
             } else {
                 Ok(None)
             }
         } else {
-            Err("Key not found".to_string())
+            Err(DatastoreError::KeyNotFound)
         }
     }
 
-    pub fn modify<F>(&mut self, key: &str, modifier: F) -> Result<(), String>
+    fn modify<F>(&mut self, key: &str, modifier: F) -> Result<(), DatastoreError>
     where
         F: FnOnce(&mut Value),
     {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get_mut(key) {
-            let value = Arc::get_mut(&mut item.value).ok_or("Concurrent access error")?;
-            modifier(value);
+            let value = Arc::get_mut(&mut item.value).ok_or(DatastoreError::Other("Concurrent access error".to_owned()))?;
+            modifier(value.get_mut().unwrap());
             Ok(())
         } else {
-            Err("Key not found".to_string())
+            Err(DatastoreError::KeyNotFound)
         }
     }
 }
@@ -139,30 +144,49 @@ mod tests {
 
     #[test]
     fn test_set_and_get() {
-        let mut data_store = MemoryDataStore::new();
+        let mut datastore = MemoryDataStore::new();
 
-        data_store.set("key1".to_owned(), Value::Text("value1".to_owned()), None);
-        data_store.set("key2".to_owned(), Value::Text("value2".to_owned()), Some(Duration::from_secs(10)));
-        data_store.set("key3".to_owned(), Value::Number(34.3), None);
-        data_store.set("key4".to_owned(), Value::List(VecDeque::new()), None);
-        data_store.set("key5".to_owned(), Value::Set(HashSet::new()), Some(Duration::from_secs(43)));
-        data_store.set("Key6".to_owned(), Value::SortedSet(BTreeSet::new()), None);
+        let mut list = VecDeque::new();
+        list.push_back("hello".to_owned());
 
-        assert_eq!(data_store.get("key1"), Some(&Value::Text("value1".to_owned())));
-        assert_eq!(data_store.get("key2"), Some(&Value::Text("value2".to_owned())));
-        assert_eq!(data_store.get("non_existent_key"), None);
-        assert_eq!(data_store.get("key3"), Some(&Value::Number(34.3)));
-        assert_eq!(data_store.get("key4"), Some(&Value::List(VecDeque::new())));
-        // assert_eq!(data_store.get("key5"), Some(&Value::Text("value2".to_owned())));
-        // assert_eq!(data_store.get("key6"), Some(&Value::Text("value2".to_owned())));
+        let mut set = HashSet::new();
+        set.insert("6.13".to_owned());
+
+        let mut sorted = BTreeMap::new();
+        sorted.insert(1, "geez".to_owned());
+
+        let mut vals = vec![
+            ("key1".to_owned(), Value::Text("value1".to_owned()), None),
+            ("key2".to_owned(), Value::Text("value2".to_owned()), Some(Duration::from_secs(2))),
+            ("key3".to_owned(), Value::List(list.clone()), None),
+            ("key4".to_owned(), Value::Set(set.clone()), None),
+            ("Key5".to_owned(), Value::SortedSet(sorted.clone()), None)
+        ];
+
+        for (key, value, duration) in vals {
+            datastore.set(key, value, duration);
+        }
+
+        let cases = vec![
+            ("key1", Some(Value::Text("value1".to_owned()))),
+            ("key2", None),
+            ("key3", Some(Value::List(list))),
+            ("key4", Some(Value::Set(set))),
+            ("Key5", Some(Value::SortedSet(sorted)))
+        ];
+
+        std::thread::sleep(Duration::from_secs(4));
+
+        for (key, res) in cases {
+            assert_eq!(datastore.get(key), res);
+        }
     }
 
     #[test]
     fn test_remove() {
         let mut data_store = MemoryDataStore::new();
 
-        data_store.set("key1".to_owned(), "value1".to_owned(), None);
-        data_store.set("key2".to_owned(), "value2".to_owned(), None);
+        data_store.set("key1".to_owned(), Value::Text("value1".to_owned()), None);
 
         let result = data_store.remove("key1");
         assert!(result.is_ok());
@@ -175,15 +199,33 @@ mod tests {
     fn test_expire_and_ttl() {
         let mut data_store = MemoryDataStore::new();
 
-        data_store.set("key1".to_owned(), "value1".to_owned(), Some(Duration::from_secs(1)));
-        data_store.set("key2".to_owned(), "value2".to_owned(), None);
+        data_store.set("key1".to_owned(), Value::Text("value1".to_owned()), Some(Duration::from_secs(2)));
+        data_store.set("key2".to_owned(), Value::Text("value2".to_owned()),None);
 
-        assert_eq!(data_store.ttl("key1"), Ok(Some(Duration::from_secs(1))));
+        assert!(data_store.ttl("key1").is_ok());
         assert_eq!(data_store.ttl("key2"), Ok(None));
 
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_secs(4));
 
-        assert_eq!(data_store.ttl("key1"), Err(DatastoreError::KeyNotFound));
-        assert_eq!(data_store.get("key1"), None);
+        assert!(data_store.ttl("key1").is_err());
+        assert!(data_store.get("key1").is_none());
+    }
+    
+    
+    #[test]
+    fn test_modify_existing_key() {
+        let mut datastore = MemoryDataStore::new();
+        datastore.set("key".to_owned(), Value::Text("value".to_owned()), None);
+
+        // Modify the value of an existing key
+        let res = datastore.modify("key", |value| {
+            if let Value::Text(ref mut v) = value {
+                *v = "new_value".to_owned();
+            }
+        });
+
+        // Verify that the value has been modified
+        assert!(res.is_ok());
+        assert_eq!(datastore.get("key"), Some(Value::Text("new_value".to_owned())));
     }
 }
