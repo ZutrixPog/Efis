@@ -9,7 +9,7 @@ pub enum FsError {
     ReadFailed
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq)]
 pub enum DatastoreError {
     #[error("Key doesnt exists")]
     KeyNotFound,

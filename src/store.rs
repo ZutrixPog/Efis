@@ -1,20 +1,10 @@
-use std::time::{Instant, Duration};
+use tokio::time::{self, Duration, Instant};
 use std::sync::{Arc, Mutex};
 use std::collections::{VecDeque, HashSet, BTreeMap, HashMap};
 use std::cmp::PartialEq;
 use thiserror::Error; // 1.0.40
 
 pub type Key = String;
-
-#[derive(Error, Debug, PartialEq)]
-pub enum DatastoreError {
-    #[error("Key doesnt exists")]
-    KeyNotFound,
-    #[error("Key-value is expired")]
-    KeyExpired,
-    #[error("There is something wrong")]
-    Other(String),
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -24,6 +14,7 @@ pub enum Value {
     SortedSet(BTreeMap<i64, String>),
 }
 
+#[derive(Debug)]
 struct Item {
     value: Arc<Mutex<Value>>,
     expiry: Option<Instant>,
@@ -45,8 +36,31 @@ pub trait Datastore {
     fn ttl(&self, key: &str) -> Result<Option<Duration>, DatastoreError>;
 }
 
+#[derive(Debug)]
+pub struct MemoryStoreGuard {
+    store: MemoryDataStore,
+}
+
+
+#[derive(Debug, Clone)]
 pub struct MemoryDataStore {
     data: Arc<Mutex<HashMap<String, Item>>>,
+}
+
+impl MemoryStoreGuard {
+    pub fn new() -> Self {
+        Self { store: MemoryDataStore::new() }
+    }
+
+    pub fn store(&self) -> MemoryDataStore {
+        self.store.clone()
+    }
+}
+
+impl Drop for MemoryStoreGuard {
+    fn drop(&mut self) {
+        self.store.shutdown_purge_task();
+    }
 }
 
 impl MemoryDataStore {
@@ -54,6 +68,11 @@ impl MemoryDataStore {
         Self {
             data: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+    
+    fn shutdown_purge_task(&self) {
+        let state = self.data.lock().unwrap();
+        drop(state);
     }
 }
 
@@ -144,7 +163,9 @@ mod tests {
 
     #[test]
     fn test_set_and_get() {
-        let mut datastore = MemoryDataStore::new();
+        let mut guard = MemoryStoreGuard::new();
+        let mut datastore = guard.store();
+        
 
         let mut list = VecDeque::new();
         list.push_back("hello".to_owned());
@@ -184,47 +205,49 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut data_store = MemoryDataStore::new();
+        let mut guard = MemoryStoreGuard::new();
+        let mut datastore = guard.store();
 
-        data_store.set("key1".to_owned(), Value::Text("value1".to_owned()), None);
+        datastore.set("key1".to_owned(), Value::Text("value1".to_owned()), None);
 
-        let result = data_store.remove("key1");
+        let result = datastore.remove("key1");
         assert!(result.is_ok());
 
-        let result = data_store.remove("non_existent_key");
+        let result = datastore.remove("non_existent_key");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_expire_and_ttl() {
-        let mut data_store = MemoryDataStore::new();
+        let mut guard = MemoryStoreGuard::new();
+        let mut datastore = guard.store();
 
-        data_store.set("key1".to_owned(), Value::Text("value1".to_owned()), Some(Duration::from_secs(2)));
-        data_store.set("key2".to_owned(), Value::Text("value2".to_owned()),None);
+        datastore.set("key1".to_owned(), Value::Text("value1".to_owned()), Some(Duration::from_secs(2)));
+        datastore.set("key2".to_owned(), Value::Text("value2".to_owned()),None);
 
-        assert!(data_store.ttl("key1").is_ok());
-        assert_eq!(data_store.ttl("key2"), Ok(None));
+        assert!(datastore.ttl("key1").is_ok());
+        assert_eq!(datastore.ttl("key2"), Ok(None));
 
         std::thread::sleep(Duration::from_secs(4));
 
-        assert!(data_store.ttl("key1").is_err());
-        assert!(data_store.get("key1").is_none());
+        assert!(datastore.ttl("key1").is_err());
+        assert!(datastore.get("key1").is_none());
     }
     
     
     #[test]
     fn test_modify_existing_key() {
-        let mut datastore = MemoryDataStore::new();
+        let mut guard = MemoryStoreGuard::new();
+        let mut datastore = guard.store();
+        
         datastore.set("key".to_owned(), Value::Text("value".to_owned()), None);
 
-        // Modify the value of an existing key
         let res = datastore.modify("key", |value| {
             if let Value::Text(ref mut v) = value {
                 *v = "new_value".to_owned();
             }
         });
 
-        // Verify that the value has been modified
         assert!(res.is_ok());
         assert_eq!(datastore.get("key"), Some(Value::Text("new_value".to_owned())));
     }
