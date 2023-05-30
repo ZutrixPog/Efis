@@ -2,26 +2,16 @@ use tokio::sync::{broadcast};
 use std::collections::{HashMap};
 use std::sync::{Arc, Mutex};
 
-// pub type Key = String;
-
-// #[derive(Debug, Clone, PartialEq)]
-// pub enum Value {
-//     Text(String),
-//     List(VecDeque<String>),
-//     Set(HashSet<String>),
-//     SortedSet(BTreeMap<i64, String>),
-// }
-
 pub trait PubSub {
     fn subscribe(&self, key: Key) -> broadcast::Receiver<Value>;
-    fn publish(&self, key: Key, value: Value) -> usize;
+    fn publish(&self, key: &Key, value: Value) -> usize;
 }
 
+#[derive(Debug)]
 pub struct PubSubServiceGuard {
     pubsub: PubSubService
 }
 
-#[derive(Debug)]
 impl PubSubServiceGuard{
     pub fn new() -> Self {
         Self { pubsub: PubSubService::new() }
@@ -57,7 +47,7 @@ impl PubSubService {
 }
 
 impl PubSub for PubSubService {
-    fn subscribe(&self, key: &Key) -> broadcast::Receiver<Value> {
+    fn subscribe(&self, key: Key) -> broadcast::Receiver<Value> {
         use std::collections::hash_map::Entry;
 
         let mut ps = self.pubsub.lock().unwrap();
@@ -87,46 +77,46 @@ mod tests {
     use super::*;
     use std::thread;
 
-    #[test]
-    fn test_subscribe_existing_key() {
+    #[tokio::test]
+    async fn test_subscribe_existing_key() {
         let pubsub_service = PubSubService::new();
         let key = String::from("test_key");
         let value = Value::Text(String::from("test_value"));
 
         // Subscribe to an existing key
-        let receiver = pubsub_service.subscribe(&key);
+        let mut receiver = pubsub_service.subscribe(key.clone());
 
         // Publish a value to the key
         let result = pubsub_service.publish(&key, value.clone());
 
         // Check that the value is received by the subscriber
-        assert_eq!(receiver.recv().unwrap(), value);
+        assert_eq!(receiver.recv().await.unwrap(), value);
 
         // Check that the publish operation returns 1 (one receiver)
         assert_eq!(result, 1);
     }
 
-    #[test]
-    fn test_subscribe_new_key() {
+    #[tokio::test]
+    async fn test_subscribe_new_key() {
         let pubsub_service = PubSubService::new();
         let key = String::from("test_key");
         let value = Value::Text(String::from("test_value"));
 
         // Subscribe to a new key
-        let receiver = pubsub_service.subscribe(&key);
+        let mut receiver = pubsub_service.subscribe(key.clone());
 
         // Publish a value to the key
         let result = pubsub_service.publish(&key, value.clone());
 
         // Check that the value is received by the subscriber
-        assert_eq!(receiver.recv().unwrap(), value);
+        assert_eq!(receiver.recv().await.unwrap(), value);
 
         // Check that the publish operation returns 1 (one receiver)
         assert_eq!(result, 1);
     }
 
-    #[test]
-    fn test_publish_nonexistent_key() {
+    #[tokio::test]
+    async fn test_publish_nonexistent_key() {
         let pubsub_service = PubSubService::new();
         let key = String::from("test_key");
         let value = Value::Text(String::from("test_value"));
@@ -138,8 +128,8 @@ mod tests {
         assert_eq!(result, 0);
     }
 
-    #[test]
-    fn test_shutdown_purge_task() {
+    #[tokio::test]
+    async fn test_shutdown_purge_task() {
         let pubsub_service = Arc::new(PubSubService::new());
 
         // Spawn a thread to simulate the purge task
