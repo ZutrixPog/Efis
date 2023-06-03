@@ -2,9 +2,11 @@ use tokio::sync::{broadcast};
 use std::collections::{HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::store::Key;
+
 pub trait PubSub {
-    fn subscribe(&self, key: Key) -> broadcast::Receiver<Value>;
-    fn publish(&self, key: &Key, value: Value) -> usize;
+    fn subscribe(&self, key: Key) -> broadcast::Receiver<String>;
+    fn publish(&self, key: Key, value: String) -> usize;
 }
 
 #[derive(Debug)]
@@ -17,7 +19,7 @@ impl PubSubServiceGuard{
         Self { pubsub: PubSubService::new() }
     }
 
-    pub fn store(&self) -> PubSubService {
+    pub fn ps(&self) -> PubSubService {
         self.pubsub.clone()
     }
 }
@@ -30,7 +32,7 @@ impl Drop for PubSubServiceGuard {
 
 #[derive(Debug, Clone)]
 pub struct PubSubService {
-    pubsub: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
+    pubsub: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
 }
 
 impl PubSubService {
@@ -47,7 +49,7 @@ impl PubSubService {
 }
 
 impl PubSub for PubSubService {
-    fn subscribe(&self, key: Key) -> broadcast::Receiver<Value> {
+    fn subscribe(&self, key: Key) -> broadcast::Receiver<String> {
         use std::collections::hash_map::Entry;
 
         let mut ps = self.pubsub.lock().unwrap();
@@ -62,11 +64,11 @@ impl PubSub for PubSubService {
         }
     }
 
-    fn publish(&self, key: &Key, value: Value) -> usize {
+    fn publish(&self, key: Key, value: String) -> usize {
         let ps = self.pubsub.lock().unwrap();
 
         ps
-        .get(key)
+        .get(&key)
         .map(|tx| tx.send(value).unwrap_or(0))
         .unwrap_or(0)
     }
@@ -81,13 +83,13 @@ mod tests {
     async fn test_subscribe_existing_key() {
         let pubsub_service = PubSubService::new();
         let key = String::from("test_key");
-        let value = Value::Text(String::from("test_value"));
+        let value = String::from("test_value");
 
         // Subscribe to an existing key
         let mut receiver = pubsub_service.subscribe(key.clone());
 
         // Publish a value to the key
-        let result = pubsub_service.publish(&key, value.clone());
+        let result = pubsub_service.publish(key, value.clone());
 
         // Check that the value is received by the subscriber
         assert_eq!(receiver.recv().await.unwrap(), value);
@@ -100,13 +102,13 @@ mod tests {
     async fn test_subscribe_new_key() {
         let pubsub_service = PubSubService::new();
         let key = String::from("test_key");
-        let value = Value::Text(String::from("test_value"));
+        let value = String::from("test_value");
 
         // Subscribe to a new key
         let mut receiver = pubsub_service.subscribe(key.clone());
 
         // Publish a value to the key
-        let result = pubsub_service.publish(&key, value.clone());
+        let result = pubsub_service.publish(key, value.clone());
 
         // Check that the value is received by the subscriber
         assert_eq!(receiver.recv().await.unwrap(), value);
@@ -119,10 +121,10 @@ mod tests {
     async fn test_publish_nonexistent_key() {
         let pubsub_service = PubSubService::new();
         let key = String::from("test_key");
-        let value = Value::Text(String::from("test_value"));
+        let value = String::from("test_value");
 
         // Publish a value to a non-existent key
-        let result = pubsub_service.publish(&key, value);
+        let result = pubsub_service.publish(key, value);
 
         // Check that the publish operation returns 0 (no receivers)
         assert_eq!(result, 0);

@@ -18,3 +18,19 @@ pub enum DatastoreError {
     #[error("There is something wrong")]
     Other(String),
 }
+
+#[derive(Error, Debug, PartialEq)]
+pub enum ServiceError {
+    #[error("Service: couldn't find the key")]
+    KeyNotFound,
+    #[error("Service: couldn't write value in data store.")]
+    ErrorWrite,
+    #[error("Service: value specified to the key is not valid.")]
+    InvalidValueType,
+    #[error("Service: specified key is expired.")]
+    KeyExpired,
+    #[error("Service: couldn't decrement value.")]
+    ErrorDecr,
+    #[error("Service: There is something wrong")]
+    Other(String),
+}

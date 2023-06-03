@@ -23,7 +23,7 @@ enum EfisCommand<'a> {
     RPop(&'a str),
     SAdd(&'a str, Vec<&'a str>),
     SMembers(&'a str),
-    ZAdd(&'a str, &'a str),
+    ZAdd(&'a str, &'a str, &'a str),
     ZRange(&'a str, u32, u32),
     Publish(&'a str, &'a str),
     Unknown(&'a str),
@@ -163,10 +163,12 @@ fn parse_smembers_command(input: &str) -> IResult<&str, EfisCommand> {
 fn parse_zadd_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, _) = tag("ZADD")(input)?;
     let (input, _) = parse_whitespace(input)?;
+    let (input, key) = parse_token(input)?;
+    let (input, _) = parse_whitespace(input)?;
     let (input, score) = parse_token(input)?;
     let (input, _) = parse_whitespace(input)?;
     let (input, member) = parse_token(input)?;
-    Ok((input, EfisCommand::ZAdd(score, member)))
+    Ok((input, EfisCommand::ZAdd(key, score, member)))
 }
 
 fn parse_zrange_command(input: &str) -> IResult<&str, EfisCommand> {
@@ -335,8 +337,8 @@ mod tests {
 
     #[test]
     fn test_parse_zadd_command() {
-        let input = "ZADD 3 member1";
-        let expected = Ok(("", EfisCommand::ZAdd("3", "member1")));
+        let input = "ZADD 3 2 member1";
+        let expected = Ok(("", EfisCommand::ZAdd("3", "2", "member1")));
         assert_eq!(parse_command(input), expected);
     }
 

@@ -4,6 +4,8 @@ use std::collections::{VecDeque, HashSet, BTreeMap, HashMap};
 use std::cmp::PartialEq;
 use thiserror::Error; // 1.0.40
 
+use crate::errors::*;
+
 pub type Key = String;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,7 +87,7 @@ impl Datastore for MemoryDataStore {
             expiry: expiry.map(|d| Instant::now() + d),
         };
         let mut data = self.data.lock().unwrap();
-        data.insert(key, item);
+        data.entry(key).or_insert(item);
         Ok(())
     }
 
