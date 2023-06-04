@@ -7,7 +7,7 @@ use crate::store::{Value, MemoryDataStore, Datastore, MemoryStoreGuard};
 use crate::pubsub::{PubSub, PubSubService, PubSubServiceGuard};
 use crate::errors::{ServiceError, DatastoreError};
 
-pub trait EfisService {
+pub trait Service {
     fn set(&mut self, key: &str, value: &str, exp: Option<u64>) -> Result<(), ServiceError>;
     fn get(&self, key: &str) -> Result<String, ServiceError>;
     fn delete(&mut self, key: &str) -> Result<(), ServiceError>;
@@ -28,12 +28,12 @@ pub trait EfisService {
 }
 
 #[derive(Clone)]
-pub struct StoreService<S: Datastore<Type = Value>, P: PubSub> {
+pub struct EfisService<S: Datastore<Type = Value>, P: PubSub> {
     store: S,
     pubsub: P
 }
 
-impl<S: Datastore<Type = Value>, P: PubSub> StoreService<S, P> {
+impl<S: Datastore<Type = Value>, P: PubSub> EfisService<S, P> {
     fn new(store: S, pubsub: P) -> Self {
         Self {
             store,
@@ -42,7 +42,7 @@ impl<S: Datastore<Type = Value>, P: PubSub> StoreService<S, P> {
     }
 }
 
-impl<S: Datastore<Type = Value>, P: PubSub> EfisService for StoreService<S, P> {
+impl<S: Datastore<Type = Value>, P: PubSub> Service for EfisService<S, P> {
     fn set(&mut self, key: &str, value: &str, exp: Option<u64>) -> Result<(), ServiceError> {
         let duration = exp.map(Duration::from_secs);
         self.store.set(key.to_string(), Value::Text(value.to_string()), duration)
@@ -258,12 +258,12 @@ impl<S: Datastore<Type = Value>, P: PubSub> EfisService for StoreService<S, P> {
 mod tests {
     use super::*;
 
-    fn setup() -> StoreService<MemoryDataStore, PubSubService> {
+    fn setup() -> EfisService<MemoryDataStore, PubSubService> {
         let guard = MemoryStoreGuard::new();
         let store = guard.store();
         let pguard = PubSubServiceGuard::new();
         let pubsub = pguard.ps();
-        StoreService::new(store, pubsub)
+        EfisService::new(store, pubsub)
     }
 
     #[test]

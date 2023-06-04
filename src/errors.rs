@@ -30,7 +30,11 @@ pub enum ServiceError {
     #[error("Service: specified key is expired.")]
     KeyExpired,
     #[error("Service: couldn't decrement value.")]
-    ErrorDecr,
-    #[error("Service: There is something wrong")]
     Other(String),
+}
+
+#[derive(Error, Debug, PartialEq)]
+pub enum SerializerError {
+    #[error("couldn't processed specified type.")]
+    InvalidValueType,
 }

@@ -1,10 +1,11 @@
-use tokio::time::{self, Duration, Instant};
+use tokio::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use std::collections::{VecDeque, HashSet, BTreeMap, HashMap};
 use std::cmp::PartialEq;
-use thiserror::Error; // 1.0.40
+use bincode::{Encode, Decode};
 
 use crate::errors::*;
+use crate::serializer::{encode, decode};
 
 pub type Key = String;
 
@@ -16,9 +17,9 @@ pub enum Value {
     SortedSet(BTreeMap<i64, String>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Encode, Decode)]
 struct Item {
-    value: Arc<Mutex<Value>>,
+    value: Value,
     expiry: Option<Instant>,
 }
 
@@ -36,6 +37,10 @@ pub trait Datastore {
     fn expire(&mut self, key: &str, expire_duration: Duration) -> Result<(), DatastoreError>;
     
     fn ttl(&self, key: &str) -> Result<Option<Duration>, DatastoreError>;
+
+    fn encode(&self) -> Result<Vec<u8>, DatastoreError>;
+
+    fn from_bytes(b: Vec<u8>) -> Self;
 }
 
 #[derive(Debug)]
@@ -83,7 +88,7 @@ impl Datastore for MemoryDataStore {
 
     fn set(&mut self, key: String, value: Self::Type, expiry: Option<Duration>) -> Result<(), DatastoreError> {
         let item = Item {
-            value: Arc::new(Mutex::new(value)),
+            value: value,
             expiry: expiry.map(|d| Instant::now() + d),
         };
         let mut data = self.data.lock().unwrap();
@@ -101,7 +106,7 @@ impl Datastore for MemoryDataStore {
                 }
             }
             
-            Some((*item.value.lock().unwrap()).clone())
+            Some(item.value.clone())
         } else {
             None
         }
@@ -150,12 +155,21 @@ impl Datastore for MemoryDataStore {
     {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get_mut(key) {
-            let value = Arc::get_mut(&mut item.value).ok_or(DatastoreError::Other("Concurrent access error".to_owned()))?;
-            modifier(value.get_mut().unwrap());
+            let value = &mut item.value;
+            modifier(value);
             Ok(())
         } else {
             Err(DatastoreError::KeyNotFound)
         }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, DatastoreError> {
+        // encode(self.clone()).map_err(|| DatastoreError::Other("Problem encoding data store".to_string()));
+        !unimplemented!()
+    }
+
+    fn from_bytes(b: Vec<u8>) -> Self {
+        !unimplemented!()
     }
 }
 
