@@ -38,3 +38,13 @@ pub enum SerializerError {
     #[error("couldn't processed specified type.")]
     InvalidValueType,
 }
+
+#[derive(Error, Debug, PartialEq)]
+pub enum PersistError {
+    #[error("couldn't save data.")]
+    ErrorSave,
+    #[error("couldn't read data.")]
+    ErrorRead,
+    #[error("couldn't find backup data.")]
+    ErrorNoBackup,
+}

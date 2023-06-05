@@ -30,14 +30,14 @@ pub trait Service {
 #[derive(Clone)]
 pub struct EfisService<S: Datastore<Type = Value>, P: PubSub> {
     store: S,
-    pubsub: P
+    pubsub: P,
 }
 
 impl<S: Datastore<Type = Value>, P: PubSub> EfisService<S, P> {
     fn new(store: S, pubsub: P) -> Self {
         Self {
             store,
-            pubsub
+            pubsub,
         }
     }
 }
@@ -259,7 +259,7 @@ mod tests {
     use super::*;
 
     fn setup() -> EfisService<MemoryDataStore, PubSubService> {
-        let guard = MemoryStoreGuard::new();
+        let guard = MemoryStoreGuard::new(None);
         let store = guard.store();
         let pguard = PubSubServiceGuard::new();
         let pubsub = pguard.ps();
