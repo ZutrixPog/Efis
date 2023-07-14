@@ -9,7 +9,7 @@ use tracing::{debug, error, info, instrument};
 /// which performs the TCP listening and initialization of per-connection state.
 #[derive(Debug)]
 struct Listener {
-    db_holder: Arc<Mutex<Datastore>>,
+    datastore_holder: Arc<Mutex<Datastore>>,
     listener: TcpListener,
     limit_connections: Arc<Semaphore>,
     notify_shutdown: broadcast::Sender<()>,
@@ -38,7 +38,7 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) {
     // Initialize the listener state
     let mut server = Listener {
         listener,
-        db_holder: DbDropGuard::new(),
+        datastore_holder: MemoryStoreGuard::new(),
         limit_connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         notify_shutdown,
         shutdown_complete_tx,
@@ -146,7 +146,7 @@ impl Listener {
             // Create the necessary per-connection handler state.
             let mut handler = Handler {
                 // Get a handle to the shared database.
-                db: self.db_holder.db(),
+                db: self.datastore_holder.store(),
 
                 // Initialize the connection state. This allocates read/write
                 // buffers to perform redis protocol frame parsing.

@@ -258,125 +258,125 @@ impl<S: Datastore<Type = Value>, P: PubSub> Service for EfisService<S, P> {
 mod tests {
     use super::*;
 
-    fn setup() -> EfisService<MemoryDataStore, PubSubService> {
-        let guard = MemoryStoreGuard::new(None);
+    async fn setup() -> EfisService<MemoryDataStore, PubSubService> {
+        let guard = MemoryStoreGuard::new(None).await;
         let store = guard.store();
         let pguard = PubSubServiceGuard::new();
         let pubsub = pguard.ps();
         EfisService::new(store, pubsub)
     }
 
-    #[test]
-    fn test_set() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_set() {
+        let mut store_service = setup().await;
         let result = store_service.set("key", "value", Some(10));
         assert_eq!(result, Ok(()));
     }
 
-    #[test]
-    fn test_get() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_get() {
+        let mut store_service = setup().await;
         store_service.set("key", "value", Some(10)).unwrap();
         let result = store_service.get("key");
         assert_eq!(result, Ok("value".to_string()));
     }
 
-    #[test]
-    fn test_delete() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_delete() {
+        let mut store_service = setup().await;
         store_service.set("key", "value", Some(10)).unwrap();
         let result = store_service.delete("key");
         assert_eq!(result, Ok(()));
     }
 
-    #[test]
-    fn test_increment() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_increment() {
+        let mut store_service = setup().await;
         store_service.set("key", "1", Some(10)).unwrap();
         let result = store_service.increment("key");
         assert_eq!(result, Ok("2".to_string()));
     }
 
-    #[test]
-    fn test_decrement() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_decrement() {
+        let mut store_service = setup().await;
         store_service.set("key", "2", Some(10)).unwrap();
         let result = store_service.decrement("key");
         assert_eq!(result, Ok("1".to_string()));
     }
 
-    #[test]
-    fn test_expire() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_expire() {
+        let mut store_service = setup().await;
         store_service.set("key", "value", None).unwrap();
         let result = store_service.expire("key", 10);
         assert_eq!(result, Ok(()));
     }
 
-    #[test]
-    fn test_ttl() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_ttl() {
+        let mut store_service = setup().await;
         store_service.set("key", "value", Some(10)).unwrap();
         let result = store_service.ttl("key");
         assert_eq!(result, Ok("9".to_string()));
     }
 
-    #[test]
-    fn test_lpush() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_lpush() {
+        let mut store_service = setup().await;
         let result = store_service.lpush("key", vec!["1", "2", "3"]);
         assert_eq!(result, Ok(()));
     }
 
-    #[test]
-    fn test_rpush() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_rpush() {
+        let mut store_service = setup().await;
         store_service.set("key", "value", None).unwrap();
         let result = store_service.rpush("key", vec!["1", "2", "3"]);
         assert_eq!(result, Ok(()));
     }
 
-    #[test]
-    fn test_lpop() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_lpop() {
+        let mut store_service = setup().await;
         store_service.lpush("key", vec!["1", "2", "3"]).unwrap();
         let result = store_service.lpop("key");
         assert_eq!(result, Ok("3".to_string()));
     }
 
-    #[test]
-    fn test_rpop() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_rpop() {
+        let mut store_service = setup().await;
         store_service.lpush("key", vec!["1", "2", "3"]).unwrap();
         let result = store_service.rpop("key");
         assert_eq!(result, Ok("1".to_string()));
     }
 
-    #[test]
-    fn test_sadd() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_sadd() {
+        let mut store_service = setup().await;
         let result = store_service.sadd("key", vec!["value1", "value2", "value3"]);
         assert_eq!(result, Ok(()));
     }
 
-    #[test]
-    fn test_smembers() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_smembers() {
+        let mut store_service = setup().await;
         store_service.sadd("key", vec!["value1", "value2", "value3"]).unwrap();
         let result = store_service.smembers("key");
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_zadd() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_zadd() {
+        let mut store_service = setup().await;
         let result = store_service.zadd("key", "12", "value");
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_zrange() {
-        let mut store_service = setup();
+    #[tokio::test]
+    async fn test_zrange() {
+        let mut store_service = setup().await;
         store_service.zadd("key", "3", "value1").unwrap();
         store_service.zadd("key", "2" ,"value2").unwrap();
         store_service.zadd("key", "1", "value3").unwrap();
@@ -386,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pubsub() {
-        let mut service = setup();
+        let mut service = setup().await;
         let key = "test_key";
         let value = "test_value";
 
