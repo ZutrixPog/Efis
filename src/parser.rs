@@ -225,13 +225,6 @@ fn parse_whitespace_then_number(input: &str) -> IResult<&str, u64> {
     preceded(parse_whitespace, parse_number)(input)
 }
 
-fn parse_ttl_option(input: &str) -> IResult<&str, Option<u64>> {
-    let (input, _) = preceded(parse_whitespace, tag("TTL"))(input)?;
-    let (input, _) = parse_whitespace(input)?;
-    let (input, ttl) = parse_number(input)?;
-    Ok((input, Some(ttl)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

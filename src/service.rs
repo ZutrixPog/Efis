@@ -1,14 +1,12 @@
 use std::collections::{HashSet, VecDeque, BTreeMap};
 
-use async_trait::async_trait;
 use tokio::time::Duration;
 
 use crate::parser::EfisCommand;
-use crate::store::{Value, Datastore, DatastoreGuard};
-use crate::pubsub::{PubSub, PubSubGuard};
+use crate::store::{Value, Datastore};
+use crate::pubsub::PubSub;
 use crate::errors::{ServiceError, DatastoreError};
 
-#[async_trait]
 pub trait Service {
     fn set(&mut self, key: &str, value: &str, exp: Option<u64>) -> Result<(), ServiceError>;
     fn get(&self, key: &str) -> Result<String, ServiceError>;
@@ -26,13 +24,12 @@ pub trait Service {
     fn zadd(&mut self, key: &str, score: &str, value: &str) -> Result<(), ServiceError>;
     fn zrange(&self, key: &str, start: u64, end: u64) -> Result<String, ServiceError>;
     fn publish(&mut self, key: &str, value: &str) -> Result<(), ServiceError>;
-    async fn subscribe<F>(&self, key: &str, handler: F) -> Result<(), ServiceError> where F: FnMut(String) + Send;
 }
 
 #[derive(Debug)]
 pub struct EfisService {
     store: Datastore,
-    pubsub: PubSub,
+    pub pubsub: PubSub,
 }
 
 impl EfisService {
@@ -43,10 +40,7 @@ impl EfisService {
         }
     }
 
-    pub fn process_cmd<F>(&mut self, cmd: EfisCommand, sub_handler: F) -> Result<String, ServiceError>
-    where
-        F: FnMut(String) + Send
-     {
+    pub fn process_cmd(&mut self, cmd: EfisCommand) -> Result<String, ServiceError> {
         let ok_res = Ok("ok".to_string());
         match cmd {
             EfisCommand::Set(key, value, expiration) => self.set(key, value, expiration).and(ok_res),
@@ -65,16 +59,11 @@ impl EfisService {
             EfisCommand::ZAdd(key, member, score) => self.zadd(key, member, score).and(ok_res),
             EfisCommand::ZRange(key, start, stop) => self.zrange(key, start, stop),
             EfisCommand::Publish(channel, message) => self.publish(channel, message).and(ok_res),
-            EfisCommand::Subscribe(channel) => {
-                self.subscribe(channel, sub_handler);
-                ok_res
-            },
             _ => Err(ServiceError::Other("Command not found".to_string())),
         }
     }
 }
 
-#[async_trait]
 impl Service for EfisService {
     fn set(&mut self, key: &str, value: &str, exp: Option<u64>) -> Result<(), ServiceError> {
         let duration = exp.map(Duration::from_secs);
@@ -281,34 +270,18 @@ impl Service for EfisService {
 
     fn publish(&mut self, key: &str, value: &str) -> Result<(), ServiceError> {
         let sent = self.pubsub.publish(key.to_string(), value.to_owned());
-        if sent > 0 {Ok(())} else {Err(ServiceError::ErrorWrite)}
-    }
-
-    async fn subscribe<F>(&self, key: &str, mut handler: F) -> Result<(), ServiceError>
-    where 
-        F: FnMut(String) + Send
-    {
-        let mut sub = self.pubsub.subscribe(key.to_owned());
-        loop {
-            if let Ok(msg) = sub.recv().await {
-                if msg.contains("exit") {
-                    break;
-                }
-                handler(msg);
-            } else {
-                return Err(ServiceError::Other("err".to_string()));
-            }
-        }
-        Ok(())
+        if sent > 0 {Ok(())} else {Err(ServiceError::ErrorPublish)}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::DatastoreGuard;
+    use crate::pubsub::PubSubGuard;
 
     async fn setup() -> EfisService {
-        let guard = DatastoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None, None).await;
         let store = guard.store();
         let pguard = PubSubGuard::new();
         let pubsub = pguard.ps();
@@ -433,17 +406,17 @@ mod tests {
         assert_eq!(result, Ok("[\"value3\", \"value2\"]".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_pubsub() {
-        let mut service = setup().await;
-        let key = "test_key";
-        let value = "test_value";
+    // #[tokio::test]
+    // async fn test_pubsub() {
+    //     let mut service = setup().await;
+    //     let key = "test_key";
+    //     let value = "test_value";
 
-        service.subscribe(key, |msg| {
-            assert_eq!(msg, value.to_owned());
-        });
+    //     service.subscribe(key, |msg| {
+    //         assert_eq!(msg, value.to_owned());
+    //     });
         
-        service.publish(key, value);
+    //     service.publish(key, value);
 
-    }
+    // }
 }

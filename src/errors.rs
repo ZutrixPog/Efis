@@ -1,4 +1,3 @@
-use std::error;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -25,6 +24,10 @@ pub enum ServiceError {
     KeyNotFound,
     #[error("Service: couldn't write value in data store.")]
     ErrorWrite,
+    #[error("Service: couldn't publish value on this channel (no listener)")]
+    ErrorPublish,
+    #[error("Service: couldn't subscribe to the channel")]
+    ErrorSubscribe,
     #[error("Service: value specified to the key is not valid.")]
     InvalidValueType,
     #[error("Service: specified key is expired.")]

@@ -10,7 +10,7 @@ use crate::errors::ServiceError;
 use crate::pubsub::PubSubGuard;
 use crate::service::EfisService;
 use crate::store::DatastoreGuard;
-use crate::parser::parse_command;
+use crate::parser::{parse_command, EfisCommand};
 
 struct Listener {
     datastore_holder: DatastoreGuard,
@@ -31,10 +31,10 @@ struct Handler {
 
 const MAX_CONNECTIONS: usize = 300;
 
-pub async fn run(listener: TcpListener, shutdown: impl Future, backup_dur: Option<Duration>) {
+pub async fn run(listener: TcpListener, shutdown: impl Future, backup_dur: Option<Duration>, persist_path: Option<String>) {
     let (notify_shutdown, _) = broadcast::channel(1);
     let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
-    let store = DatastoreGuard::new(backup_dur).await;
+    let store = DatastoreGuard::new(backup_dur, persist_path).await;
     let pubsub = PubSubGuard::new();
 
     let mut server = Listener {
@@ -139,12 +139,19 @@ impl Handler {
                 return Err(ServiceError::InvalidValueType);
             }
 
-            let sub_handler = |msg: String| {
-                let _ = self.socket.write(msg.as_bytes());
-            };
-
             let command = parse_command(std::str::from_utf8(&buf).unwrap()).unwrap();
-            let res = self.svc.process_cmd(command.1, sub_handler);
+            // TODO: there must be a cleaner way
+            if let EfisCommand::Subscribe(chan) = command.1 {
+                let mut sub = self.svc.pubsub.subscribe(chan.to_owned());
+                while let Ok(msg) = sub.recv().await {
+                    if msg.contains("exit") {
+                        break;
+                    }
+    
+                    let _ = self.socket.write(msg.as_bytes()).await;
+                }
+            }
+            let res = self.svc.process_cmd(command.1);
             let mut res = if let Err(err) = res {err.to_string()} else {res.unwrap()};
             res.push_str("\n");
             let _ = self.socket.write((res).as_bytes()).await;

@@ -1,5 +1,5 @@
 [package]
-name = "Efis"
+name = "efis"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,6 +10,7 @@ tokio = { version = "1.28.1", features = ["full"] }
 nom = "7.1.3"
 rand = "0.8.3"
 thiserror = "1.0.40"
+envy = "0.4"
 bincode = "1.3"
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.5.0"

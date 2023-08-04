@@ -1,10 +1,7 @@
-use std::clone;
 use std::path::{PathBuf, Path};
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::__private::PathAsDisplay;
 use tokio::fs::{self, File, OpenOptions};
 use rand::Rng;
-use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::errors::PersistError;
@@ -18,7 +15,7 @@ pub struct FileBackupRepo {
 
 impl FileBackupRepo {
     pub fn new(path: PathBuf) -> Self {
-        fs::create_dir_all(path.clone());
+        let _ = fs::create_dir_all(path.clone());
         Self {
             path
         }
@@ -81,31 +78,37 @@ fn generate_tmp_name() -> String {
     format!("tmp.{}", rng.gen::<i32>())
 }
 
-#[tokio::test]
-async fn test_file_backup_repo_save_and_retrieve() {
-    let temp_dir = tempdir().unwrap();
-    let repo = FileBackupRepo::new(temp_dir.path().to_path_buf());
+#[cfg(test)]
+mod tests {
+    use crate::persist::repo::*;
+    use tempfile::tempdir;
 
-    // Prepare test data
-    let data = b"test data".to_vec();
-
-    // Save the data
-    let save_result = repo.save(data.clone()).await;
-    assert!(save_result.is_ok());
-
-    // Retrieve the data
-    let retrieve_result = repo.retrieve().await;
-    assert!(retrieve_result.is_ok());
-    let retrieved_data = retrieve_result.unwrap();
-    assert_eq!(retrieved_data, data);
-}
-
-#[tokio::test]
-async fn test_file_backup_repo_retrieve_no_backup() {
-    let temp_dir = tempdir().unwrap();
-    let repo = FileBackupRepo::new(temp_dir.path().to_path_buf());
-
-    let retrieve_result = repo.retrieve().await;
-    assert!(retrieve_result.is_err());
-    assert_eq!(retrieve_result.unwrap_err(), PersistError::ErrorNoBackup);
+    #[tokio::test]
+    async fn test_file_backup_repo_save_and_retrieve() {
+        let temp_dir = tempdir().unwrap();
+        let repo = FileBackupRepo::new(temp_dir.path().to_path_buf());
+    
+        // Prepare test data
+        let data = b"test data".to_vec();
+    
+        // Save the data
+        let save_result = repo.save(data.clone()).await;
+        assert!(save_result.is_ok());
+    
+        // Retrieve the data
+        let retrieve_result = repo.retrieve().await;
+        assert!(retrieve_result.is_ok());
+        let retrieved_data = retrieve_result.unwrap();
+        assert_eq!(retrieved_data, data);
+    }
+    
+    #[tokio::test]
+    async fn test_file_backup_repo_retrieve_no_backup() {
+        let temp_dir = tempdir().unwrap();
+        let repo = FileBackupRepo::new(temp_dir.path().to_path_buf());
+    
+        let retrieve_result = repo.retrieve().await;
+        assert!(retrieve_result.is_err());
+        assert_eq!(retrieve_result.unwrap_err(), PersistError::ErrorNoBackup);
+    }
 }

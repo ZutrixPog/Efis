@@ -33,16 +33,16 @@ struct Item {
 #[derive(Debug)]
 pub struct DatastoreGuard {
     store: Datastore,
-    interval: Option<Duration>
+    interval: Option<Duration>,
 }
 
 impl DatastoreGuard {
-    pub async fn new(interval: Option<Duration>) -> Self {
-        let repo = FileBackupRepo::new(Path::new(PATH).to_path_buf());
+    pub async fn new(interval: Option<Duration>, path: Option<String>) -> Self {
+        let repo = FileBackupRepo::new(Path::new(&path.unwrap_or(PATH.to_string())).to_path_buf());
         if let Ok(data) = repo.retrieve().await {
             return DatastoreGuard::from(data);
         }
-        Self { store: Datastore::new(), interval }
+        Self { store: Datastore::new(), interval,  }
     }
     
     pub fn store(&self) -> Datastore {
@@ -202,7 +202,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_and_get() {
-        let guard = DatastoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None, None).await;
         let mut datastore = guard.store();
         
 
@@ -244,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove() {
-        let guard = DatastoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None, None).await;
         let mut datastore = guard.store();
 
         datastore.set("key1".to_owned(), Value::Text("value1".to_owned()), None);
@@ -258,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expire_and_ttl() {
-        let guard = DatastoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None, None).await;
         let mut datastore = guard.store();
 
         datastore.set("key1".to_owned(), Value::Text("value1".to_owned()), Some(Duration::from_secs(2)));
@@ -275,7 +275,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_modify_existing_key() {
-        let guard = DatastoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None, None).await;
         let mut datastore = guard.store();
         
         datastore.set("key".to_owned(), Value::Text("value".to_owned()), None);
@@ -292,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_decode() {
-        let guard = DatastoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None, None).await;
         let mut datastore = guard.store();
 
         let (key, value) = ("key", Value::Text("value".to_owned()));
@@ -321,7 +321,7 @@ mod tests {
         let backup_interval = Duration::from_secs(1);
         let data = String::from("data");
 
-        let guard = DatastoreGuard::new(Some(backup_interval)).await;
+        let guard = DatastoreGuard::new(Some(backup_interval), None).await;
         let mut store = guard.store();
         store.set("data".to_owned(), Value::Text(data), None);
 
