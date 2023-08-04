@@ -84,9 +84,10 @@ impl Service for EfisService {
 
     fn get(&self, key: &str) -> Result<String, ServiceError> {
         self.store.get(key)
-            .ok_or(ServiceError::KeyNotFound)
-            .and_then(|value| match value {
-                Value::Text(text) => Ok(text),
+        .ok_or(ServiceError::KeyNotFound)
+        .and_then(|value| match value {
+            Value::Text(text) => {
+                Ok(text)},
                 _ => Err(ServiceError::InvalidValueType),
             })
     }

@@ -60,11 +60,13 @@ impl PubSub {
     }
 
     pub fn publish(&self, key: Key, value: String) -> usize {
-        let ps = self.pubsub.lock().unwrap();
+        let mut ps = self.pubsub.lock().unwrap();
+
+        ps.entry(key.clone()).or_insert(broadcast::channel(1024).0);
 
         ps
         .get(&key)
-        .map(|tx| tx.send(value).unwrap_or(0))
+        .map(|tx| {println!("{}", value);tx.send(value).unwrap_or(0)})
         .unwrap_or(0)
     }
 }

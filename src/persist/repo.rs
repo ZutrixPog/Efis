@@ -32,7 +32,6 @@ impl FileBackupRepo {
         let mut fp = OpenOptions::new()
             .read(true)
             .write(true)
-            .append(true)
             .create(true)
             .open(tmp).await
             .map_err(|err| {
@@ -48,7 +47,8 @@ impl FileBackupRepo {
             fs::remove_file(tmp).await.map_err(|_| PersistError::ErrorSave)?;
         }
 
-        fs::rename(tmp_path, Path::new(&path)).await.map_err(|_| PersistError::ErrorSave)
+        fs::rename(tmp, Path::new(&path)).await.map_err(|_| PersistError::ErrorSave)?;
+        fs::remove_file(tmp).await.map_err(|_| PersistError::ErrorSave)
     }
     
     pub async fn retrieve(&self) -> Result<Vec<u8>, PersistError> {
