@@ -15,5 +15,5 @@ release: build-image
 run:
     PORT={{port}} BACKUP_PATH={{backup_path}} BACKUP_INTERVAL={{backup_interval}} cargo run
 
-run-image:
+run-docker:
     docker run --env PORT={{port}} --env BACKUP_PATH={{backup_path}} --env BACKUP_INTERVAL={{backup_interval}} your_image_name
