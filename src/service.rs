@@ -1,12 +1,14 @@
 use std::collections::{HashSet, VecDeque, BTreeMap};
 
-use tokio::sync::{broadcast};
-use tokio::time::{Duration};
+use async_trait::async_trait;
+use tokio::time::Duration;
 
-use crate::store::{Value, MemoryDataStore, Datastore, MemoryStoreGuard};
-use crate::pubsub::{PubSub, PubSubService, PubSubServiceGuard};
+use crate::parser::EfisCommand;
+use crate::store::{Value, Datastore, DatastoreGuard};
+use crate::pubsub::{PubSub, PubSubGuard};
 use crate::errors::{ServiceError, DatastoreError};
 
+#[async_trait]
 pub trait Service {
     fn set(&mut self, key: &str, value: &str, exp: Option<u64>) -> Result<(), ServiceError>;
     fn get(&self, key: &str) -> Result<String, ServiceError>;
@@ -23,26 +25,57 @@ pub trait Service {
     fn smembers(&self, key: &str) -> Result<String, ServiceError>;
     fn zadd(&mut self, key: &str, score: &str, value: &str) -> Result<(), ServiceError>;
     fn zrange(&self, key: &str, start: u64, end: u64) -> Result<String, ServiceError>;
-    fn publish(&mut self, key: &str, value: &str);
-    fn subscribe(&self, key: &str) -> broadcast::Receiver<String>;
+    fn publish(&mut self, key: &str, value: &str) -> Result<(), ServiceError>;
+    async fn subscribe<F>(&self, key: &str, handler: F) -> Result<(), ServiceError> where F: FnMut(String) + Send;
 }
 
-#[derive(Clone)]
-pub struct EfisService<S: Datastore<Type = Value>, P: PubSub> {
-    store: S,
-    pubsub: P,
+#[derive(Debug)]
+pub struct EfisService {
+    store: Datastore,
+    pubsub: PubSub,
 }
 
-impl<S: Datastore<Type = Value>, P: PubSub> EfisService<S, P> {
-    fn new(store: S, pubsub: P) -> Self {
+impl EfisService {
+    pub fn new(ds: Datastore, ps: PubSub) -> Self {
         Self {
-            store,
-            pubsub,
+            store: ds,
+            pubsub: ps,
+        }
+    }
+
+    pub fn process_cmd<F>(&mut self, cmd: EfisCommand, sub_handler: F) -> Result<String, ServiceError>
+    where
+        F: FnMut(String) + Send
+     {
+        let ok_res = Ok("ok".to_string());
+        match cmd {
+            EfisCommand::Set(key, value, expiration) => self.set(key, value, expiration).and(ok_res),
+            EfisCommand::Get(key) => self.get(key),
+            EfisCommand::Del(key) => self.delete(key).and(ok_res),
+            EfisCommand::Incr(key) => self.increment(key).and(ok_res),
+            EfisCommand::Decr(key) => self.decrement(key).and(ok_res),
+            EfisCommand::Expire(key, expiration) => self.expire(key, expiration).and(ok_res),
+            EfisCommand::TTL(key) => self.ttl(key).and(ok_res),
+            EfisCommand::LPush(key, values) => self.lpush(key, values).and(ok_res),
+            EfisCommand::RPush(key, values) => self.rpush(key, values).and(ok_res),
+            EfisCommand::LPop(key) => self.lpop(key),
+            EfisCommand::RPop(key) => self.rpop(key),
+            EfisCommand::SAdd(key, members) => self.sadd(key, members).and(ok_res),
+            EfisCommand::SMembers(key) => self.smembers(key),
+            EfisCommand::ZAdd(key, member, score) => self.zadd(key, member, score).and(ok_res),
+            EfisCommand::ZRange(key, start, stop) => self.zrange(key, start, stop),
+            EfisCommand::Publish(channel, message) => self.publish(channel, message).and(ok_res),
+            EfisCommand::Subscribe(channel) => {
+                self.subscribe(channel, sub_handler);
+                ok_res
+            },
+            _ => Err(ServiceError::Other("Command not found".to_string())),
         }
     }
 }
 
-impl<S: Datastore<Type = Value>, P: PubSub> Service for EfisService<S, P> {
+#[async_trait]
+impl Service for EfisService {
     fn set(&mut self, key: &str, value: &str, exp: Option<u64>) -> Result<(), ServiceError> {
         let duration = exp.map(Duration::from_secs);
         self.store.set(key.to_string(), Value::Text(value.to_string()), duration)
@@ -245,12 +278,27 @@ impl<S: Datastore<Type = Value>, P: PubSub> Service for EfisService<S, P> {
             })
     }
 
-    fn publish(&mut self, key: &str, value: &str) {
-        self.pubsub.publish(key.to_string(), value.to_owned());
+    fn publish(&mut self, key: &str, value: &str) -> Result<(), ServiceError> {
+        let sent = self.pubsub.publish(key.to_string(), value.to_owned());
+        if sent > 0 {Ok(())} else {Err(ServiceError::ErrorWrite)}
     }
 
-    fn subscribe(&self, key: &str) -> broadcast::Receiver<String> {
-        self.pubsub.subscribe(key.to_owned())
+    async fn subscribe<F>(&self, key: &str, mut handler: F) -> Result<(), ServiceError>
+    where 
+        F: FnMut(String) + Send
+    {
+        let mut sub = self.pubsub.subscribe(key.to_owned());
+        loop {
+            if let Ok(msg) = sub.recv().await {
+                if msg.contains("exit") {
+                    break;
+                }
+                handler(msg);
+            } else {
+                return Err(ServiceError::Other("err".to_string()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -258,10 +306,10 @@ impl<S: Datastore<Type = Value>, P: PubSub> Service for EfisService<S, P> {
 mod tests {
     use super::*;
 
-    async fn setup() -> EfisService<MemoryDataStore, PubSubService> {
-        let guard = MemoryStoreGuard::new(None).await;
+    async fn setup() -> EfisService {
+        let guard = DatastoreGuard::new(None).await;
         let store = guard.store();
-        let pguard = PubSubServiceGuard::new();
+        let pguard = PubSubGuard::new();
         let pubsub = pguard.ps();
         EfisService::new(store, pubsub)
     }
@@ -390,10 +438,11 @@ mod tests {
         let key = "test_key";
         let value = "test_value";
 
-        let mut res = service.subscribe(key);
-
+        service.subscribe(key, |msg| {
+            assert_eq!(msg, value.to_owned());
+        });
+        
         service.publish(key, value);
 
-        assert_eq!(res.recv().await, Ok(value.to_owned()));
     }
 }

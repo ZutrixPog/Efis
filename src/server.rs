@@ -1,15 +1,22 @@
 use std::future::Future;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio::time::{self, Duration};
-use tracing::{debug, error, info, instrument};
+use tracing::{error, info, instrument};
 
+use crate::errors::ServiceError;
+use crate::pubsub::PubSubGuard;
+use crate::service::EfisService;
+use crate::store::DatastoreGuard;
+use crate::parser::parse_command;
 /// Server listener state. Created in the `run` call. It includes a `run` method
 /// which performs the TCP listening and initialization of per-connection state.
-#[derive(Debug)]
+// #[derive(Debug)]
 struct Listener {
-    datastore_holder: Arc<Mutex<Datastore>>,
+    datastore_holder: DatastoreGuard,
+    pubsub_holder: PubSubGuard,
     listener: TcpListener,
     limit_connections: Arc<Semaphore>,
     notify_shutdown: broadcast::Sender<()>,
@@ -18,8 +25,9 @@ struct Listener {
 
 #[derive(Debug)]
 struct Handler {
-    db: Db,
-    connection: Connection,
+    svc: EfisService,
+    socket: TcpStream,
+    // connection: Connection,
     shutdown: Shutdown,
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -34,11 +42,14 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) {
     // one.
     let (notify_shutdown, _) = broadcast::channel(1);
     let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
+    let store = DatastoreGuard::new(Some(Duration::from_secs(120))).await;
+    let pubsub = PubSubGuard::new();
 
     // Initialize the listener state
     let mut server = Listener {
         listener,
-        datastore_holder: MemoryStoreGuard::new(),
+        datastore_holder: store,
+        pubsub_holder: pubsub,
         limit_connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         notify_shutdown,
         shutdown_complete_tx,
@@ -104,22 +115,7 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) {
 }
 
 impl Listener {
-    /// Run the server
-    ///
-    /// Listen for inbound connections. For each inbound connection, spawn a
-    /// task to process that connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if accepting returns an error. This can happen for a
-    /// number reasons that resolve over time. For example, if the underlying
-    /// operating system has reached an internal limit for max number of
-    /// sockets, accept will fail.
-    ///
-    /// The process is not able to detect when a transient error resolves
-    /// itself. One strategy for handling this is to implement a back off
-    /// strategy, which is what we do here.
-    async fn run(&mut self) -> crate::Result<()> {
+    async fn run(&mut self) -> anyhow::Result<()> {
         info!("accepting inbound connections");
 
         loop {
@@ -143,16 +139,14 @@ impl Listener {
             // error here is non-recoverable.
             let socket = self.accept().await?;
 
+            let store = self.datastore_holder.store();
+            let pubsub = self.pubsub_holder.ps();
             // Create the necessary per-connection handler state.
             let mut handler = Handler {
                 // Get a handle to the shared database.
-                db: self.datastore_holder.store(),
+                svc: EfisService::new(store, pubsub),
 
-                // Initialize the connection state. This allocates read/write
-                // buffers to perform redis protocol frame parsing.
-                connection: Connection::new(socket),
-
-                // Receive shutdown notifications.
+                socket: socket,
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
 
                 // Notifies the receiver half once all clones are
@@ -181,7 +175,7 @@ impl Listener {
     /// After the second failure, the task waits for 2 seconds. Each subsequent
     /// failure doubles the wait time. If accepting fails on the 6th try after
     /// waiting for 64 seconds, then this function returns with an error.
-    async fn accept(&mut self) -> crate::Result<TcpStream> {
+    async fn accept(&mut self) -> anyhow::Result<TcpStream> {
         let mut backoff = 1;
 
         // Try to accept a few times
@@ -221,14 +215,15 @@ impl Handler {
     /// When the shutdown signal is received, the connection is processed until
     /// it reaches a safe state, at which point it is terminated.
     #[instrument(skip(self))]
-    async fn run(&mut self) -> crate::Result<()> {
+    async fn run(&mut self) -> Result<(), ServiceError> {
         // As long as the shutdown signal has not been received, try to read a
         // new request frame.
+        // While reading a request frame, also listen for the shutdown
+        // signal.
         while !self.shutdown.is_shutdown() {
-            // While reading a request frame, also listen for the shutdown
-            // signal.
-            let maybe_frame = tokio::select! {
-                res = self.connection.read_frame() => res?,
+            let mut buf = vec![0; 1024];
+            let n = tokio::select! {
+                n = self.socket.read(&mut buf) => n.unwrap_or(0),
                 _ = self.shutdown.recv() => {
                     // If a shutdown signal is received, return from `run`.
                     // This will result in the task terminating.
@@ -236,41 +231,57 @@ impl Handler {
                 }
             };
 
-            // If `None` is returned from `read_frame()` then the peer closed
-            // the socket. There is no further work to do and the task can be
-            // terminated.
-            let frame = match maybe_frame {
-                Some(frame) => frame,
-                None => return Ok(()),
+            if n == 0 {
+                return Err(ServiceError::InvalidValueType);
+            }
+
+            let sub_handler = |msg: String| {
+                self.socket.write_all(msg.as_bytes());
             };
 
-            // Convert the redis frame into a command struct. This returns an
-            // error if the frame is not a valid redis command or it is an
-            // unsupported command.
-            let cmd = Command::from_frame(frame)?;
-
-            // Logs the `cmd` object. The syntax here is a shorthand provided by
-            // the `tracing` crate. It can be thought of as similar to:
-            //
-            // ```
-            // debug!(cmd = format!("{:?}", cmd));
-            // ```
-            //
-            // `tracing` provides structured logging, so information is "logged"
-            // as key-value pairs.
-            debug!(?cmd);
-
-            // Perform the work needed to apply the command. This may mutate the
-            // database state as a result.
-            //
-            // The connection is passed into the apply function which allows the
-            // command to write response frames directly to the connection. In
-            // the case of pub/sub, multiple frames may be send back to the
-            // peer.
-            cmd.apply(&self.db, &mut self.connection, &mut self.shutdown)
-                .await?;
+            let command = parse_command(std::str::from_utf8(&buf).unwrap()).unwrap();
+            self.svc.process_cmd(command.1, sub_handler)?;
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Shutdown {
+    /// `true` if the shutdown signal has been received
+    is_shutdown: bool,
+
+    /// The receive half of the channel used to listen for shutdown.
+    notify: broadcast::Receiver<()>,
+}
+
+impl Shutdown {
+    /// Create a new `Shutdown` backed by the given `broadcast::Receiver`.
+    pub(crate) fn new(notify: broadcast::Receiver<()>) -> Shutdown {
+        Shutdown {
+            is_shutdown: false,
+            notify,
+        }
+    }
+
+    /// Returns `true` if the shutdown signal has been received.
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.is_shutdown
+    }
+
+    /// Receive the shutdown notice, waiting if necessary.
+    pub(crate) async fn recv(&mut self) {
+        // If the shutdown signal has already been received, then return
+        // immediately.
+        if self.is_shutdown {
+            return;
+        }
+
+        // Cannot receive a "lag error" as only one value is ever sent.
+        let _ = self.notify.recv().await;
+
+        // Remember that the signal has been received.
+        self.is_shutdown = true;
     }
 }

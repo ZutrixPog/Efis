@@ -1,41 +1,36 @@
-use tokio::sync::{broadcast};
-use std::collections::{HashMap};
+use tokio::sync::broadcast;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::store::Key;
 
-pub trait PubSub {
-    fn subscribe(&self, key: Key) -> broadcast::Receiver<String>;
-    fn publish(&self, key: Key, value: String) -> usize;
-}
-
 #[derive(Debug)]
-pub struct PubSubServiceGuard {
-    pubsub: PubSubService
+pub struct PubSubGuard {
+    pubsub: PubSub
 }
 
-impl PubSubServiceGuard{
+impl PubSubGuard{
     pub fn new() -> Self {
-        Self { pubsub: PubSubService::new() }
+        Self { pubsub: PubSub::new() }
     }
 
-    pub fn ps(&self) -> PubSubService {
+    pub fn ps(&self) -> PubSub {
         self.pubsub.clone()
     }
 }
 
-impl Drop for PubSubServiceGuard {
+impl Drop for PubSubGuard {
     fn drop(&mut self) {
         self.pubsub.shutdown_purge_task();
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct PubSubService {
+pub struct PubSub {
     pubsub: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
 }
 
-impl PubSubService {
+impl PubSub {
     fn new() -> Self {
         Self {
             pubsub: Arc::new(Mutex::new(HashMap::new())),
@@ -48,8 +43,8 @@ impl PubSubService {
     }
 }
 
-impl PubSub for PubSubService {
-    fn subscribe(&self, key: Key) -> broadcast::Receiver<String> {
+impl PubSub {
+    pub fn subscribe(&self, key: Key) -> broadcast::Receiver<String> {
         use std::collections::hash_map::Entry;
 
         let mut ps = self.pubsub.lock().unwrap();
@@ -64,7 +59,7 @@ impl PubSub for PubSubService {
         }
     }
 
-    fn publish(&self, key: Key, value: String) -> usize {
+    pub fn publish(&self, key: Key, value: String) -> usize {
         let ps = self.pubsub.lock().unwrap();
 
         ps
@@ -81,7 +76,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_existing_key() {
-        let pubsub_service = PubSubService::new();
+        let pubsub_service = PubSub::new();
         let key = String::from("test_key");
         let value = String::from("test_value");
 
@@ -100,7 +95,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_new_key() {
-        let pubsub_service = PubSubService::new();
+        let pubsub_service = PubSub::new();
         let key = String::from("test_key");
         let value = String::from("test_value");
 
@@ -119,7 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_nonexistent_key() {
-        let pubsub_service = PubSubService::new();
+        let pubsub_service = PubSub::new();
         let key = String::from("test_key");
         let value = String::from("test_value");
 
@@ -132,7 +127,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shutdown_purge_task() {
-        let pubsub_service = Arc::new(PubSubService::new());
+        let pubsub_service = Arc::new(PubSub::new());
 
         // Spawn a thread to simulate the purge task
         let pubsub_service_clone = Arc::clone(&pubsub_service);

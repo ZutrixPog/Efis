@@ -1,6 +1,7 @@
 use std::clone;
 use std::path::{PathBuf, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::__private::PathAsDisplay;
 use tokio::fs::{self, File, OpenOptions};
 use rand::Rng;
 use tempfile::tempdir;
@@ -27,12 +28,17 @@ impl FileBackupRepo {
         let path = self.path.join(FILE_NAME);
         let tmp_path =  self.path.join(generate_tmp_name());
         let tmp = Path::new(&tmp_path);
+        println!("{}", tmp.as_display());
         let mut fp = OpenOptions::new()
             .read(true)
             .write(true)
+            .append(true)
             .create(true)
             .open(tmp).await
-            .map_err(|_| PersistError::ErrorSave)?;
+            .map_err(|err| {
+                println!("{}", err);
+                PersistError::ErrorSave
+            })?;
 
         if let Err(_) = fp.write_all(&data).await {
             fs::remove_file(tmp).await.map_err(|_| PersistError::ErrorSave)?;

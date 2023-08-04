@@ -1,21 +1,21 @@
 use nom::{
     branch::alt,
-    bytes::complete::{tag},
+    bytes::complete::tag,
     character::complete::{char, digit1, none_of},
     combinator::{map_res, recognize, opt},
     multi::{separated_list1, many0, many1},
-    sequence::{preceded},
+    sequence::preceded,
     IResult,
 };
 
 #[derive(Debug, PartialEq)]
-enum EfisCommand<'a> {
-    Set(&'a str, &'a str, Option<u32>),
+pub enum EfisCommand<'a> {
+    Set(&'a str, &'a str, Option<u64>),
     Get(&'a str),
     Del(&'a str),
     Incr(&'a str),
     Decr(&'a str),
-    Expire(&'a str, u32),
+    Expire(&'a str, u64),
     TTL(&'a str),
     LPush(&'a str, Vec<&'a str>),
     RPush(&'a str, Vec<&'a str>),
@@ -24,12 +24,13 @@ enum EfisCommand<'a> {
     SAdd(&'a str, Vec<&'a str>),
     SMembers(&'a str),
     ZAdd(&'a str, &'a str, &'a str),
-    ZRange(&'a str, u32, u32),
+    ZRange(&'a str, u64, u64),
     Publish(&'a str, &'a str),
+    Subscribe(&'a str),
     Unknown(&'a str),
 }
 
-fn parse_command(input: &str) -> IResult<&str, EfisCommand> {
+pub fn parse_command(input: &str) -> IResult<&str, EfisCommand> {
     alt((
         parse_set_command,
         parse_get_command,
@@ -47,6 +48,7 @@ fn parse_command(input: &str) -> IResult<&str, EfisCommand> {
         parse_zadd_command,
         parse_zrange_command,
         parse_publish_command,
+        parse_subscribe_command,
         parse_unknown_command,
     ))(input)
 }
@@ -62,7 +64,7 @@ fn parse_set_command(input: &str) -> IResult<&str, EfisCommand> {
     Ok((input, EfisCommand::Set(key, value, ttl)))
 }
 
-fn parse_ex_option(input: &str) -> IResult<&str, Option<u32>> {
+fn parse_ex_option(input: &str) -> IResult<&str, Option<u64>> {
     let (input, _) = opt(preceded(parse_whitespace, tag("EX")))(input)?;
     let (input, ttl) = opt(parse_whitespace_then_number)(input)?;
     Ok((input, ttl))
@@ -191,6 +193,13 @@ fn parse_publish_command(input: &str) -> IResult<&str, EfisCommand> {
     Ok((input, EfisCommand::Publish(channel, message)))
 }
 
+fn parse_subscribe_command(input: &str) -> IResult<&str, EfisCommand> {
+    let (input, _) = tag("SUBSCRIBE")(input)?;
+    let (input, _) = parse_whitespace(input)?;
+    let (input, channel) = parse_token(input)?;
+    Ok((input, EfisCommand::Subscribe(channel)))
+}
+
 fn parse_unknown_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, cmd) = parse_token(input)?;
     Ok((input, EfisCommand::Unknown(cmd)))
@@ -208,15 +217,15 @@ fn parse_token_list(input: &str) -> IResult<&str, Vec<&str>> {
     separated_list1(char(' '), parse_token)(input)
 }
 
-fn parse_number(input: &str) -> IResult<&str, u32> {
-    map_res(recognize(digit1), |s: &str| s.parse::<u32>())(input)
+fn parse_number(input: &str) -> IResult<&str, u64> {
+    map_res(recognize(digit1), |s: &str| s.parse::<u64>())(input)
 }
 
-fn parse_whitespace_then_number(input: &str) -> IResult<&str, u32> {
+fn parse_whitespace_then_number(input: &str) -> IResult<&str, u64> {
     preceded(parse_whitespace, parse_number)(input)
 }
 
-fn parse_ttl_option(input: &str) -> IResult<&str, Option<u32>> {
+fn parse_ttl_option(input: &str) -> IResult<&str, Option<u64>> {
     let (input, _) = preceded(parse_whitespace, tag("TTL"))(input)?;
     let (input, _) = parse_whitespace(input)?;
     let (input, ttl) = parse_number(input)?;

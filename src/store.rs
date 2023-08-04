@@ -1,10 +1,10 @@
-use tokio::time::{Duration, Instant, interval, sleep};
+use tokio::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use std::convert::From;
 use std::thread;
 use std::collections::{VecDeque, HashSet, BTreeMap, HashMap};
 use std::cmp::PartialEq;
-use std::path::{Path};
+use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::*;
@@ -12,7 +12,7 @@ use crate::persist::repo::FileBackupRepo;
 use crate::serializer::{encode, decode};
 
 
-const path: &str = "./backup";
+const PATH: &str = "./backup";
 pub type Key = String;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,38 +30,22 @@ struct Item {
     expiry: Option<Instant>,
 }
 
-pub trait Datastore {
-    type Type;
-    
-    fn set(&mut self, key: String, value: Self::Type, expire_duration: Option<Duration>) -> Result<(), DatastoreError>;
-
-    fn get(&self, key: &str) -> Option<Self::Type>;
-    
-    fn modify<F>(&mut self, key: &str, modifier: F) -> Result<(), DatastoreError> where F: FnOnce(&mut Self::Type);
-    
-    fn remove(&mut self, key: &str) -> Result<(), DatastoreError>;
-    
-    fn expire(&mut self, key: &str, expire_duration: Duration) -> Result<(), DatastoreError>;
-    
-    fn ttl(&self, key: &str) -> Result<Option<Duration>, DatastoreError>;
-}
-
 #[derive(Debug)]
-pub struct MemoryStoreGuard {
-    store: MemoryDataStore,
+pub struct DatastoreGuard {
+    store: Datastore,
     interval: Option<Duration>
 }
 
-impl MemoryStoreGuard {
+impl DatastoreGuard {
     pub async fn new(interval: Option<Duration>) -> Self {
-        let repo = FileBackupRepo::new(Path::new(path).to_path_buf());
+        let repo = FileBackupRepo::new(Path::new(PATH).to_path_buf());
         if let Ok(data) = repo.retrieve().await {
-            return MemoryStoreGuard::from(data);
+            return DatastoreGuard::from(data);
         }
-        Self { store: MemoryDataStore::new(), interval }
+        Self { store: Datastore::new(), interval }
     }
     
-    pub fn store(&self) -> MemoryDataStore {
+    pub fn store(&self) -> Datastore {
         self.store.clone()
     }
 
@@ -73,13 +57,14 @@ impl MemoryStoreGuard {
         let dur = self.interval.unwrap().clone();
         let data = self.store();
         tokio::spawn(async move {
-            let repo = FileBackupRepo::new(Path::new(path).to_path_buf());
+            let repo = FileBackupRepo::new(Path::new(PATH).to_path_buf());
             
             loop {
                 thread::sleep(dur);
                 
                 let data = data.encode().unwrap();
                 if let Err(_) = repo.save(data).await {
+                    println!("err");
                     return;
                 }
             }
@@ -87,18 +72,18 @@ impl MemoryStoreGuard {
     }
 }
 
-impl Drop for MemoryStoreGuard {
+impl Drop for DatastoreGuard {
     fn drop(&mut self) {
         self.store.shutdown_purge_task();
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct MemoryDataStore {
+pub struct Datastore {
     data: Arc<Mutex<HashMap<String, Item>>>,
 }
 
-impl MemoryDataStore {
+impl Datastore {
     pub fn new() -> Self {
         Self {
             data: Arc::new(Mutex::new(HashMap::new()))
@@ -117,10 +102,8 @@ impl MemoryDataStore {
     }
 }
 
-impl Datastore for MemoryDataStore {
-    type Type = Value;    
-
-    fn set(&mut self, key: String, value: Self::Type, expiry: Option<Duration>) -> Result<(), DatastoreError> {
+impl Datastore {
+    pub fn set(&mut self, key: String, value: Value, expiry: Option<Duration>) -> Result<(), DatastoreError> {
         let item = Item {
             value: value,
             expiry: expiry.map(|d| Instant::now() + d),
@@ -130,7 +113,7 @@ impl Datastore for MemoryDataStore {
         Ok(())
     }
 
-    fn get(&self, key: &str) -> Option<Self::Type> {
+    pub fn get(&self, key: &str) -> Option<Value> {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get(key) {
             if let Some(expiry) = item.expiry {
@@ -146,7 +129,7 @@ impl Datastore for MemoryDataStore {
         }
     }
 
-    fn remove(&mut self, key: &str) -> Result<(), DatastoreError> {
+    pub fn remove(&mut self, key: &str) -> Result<(), DatastoreError> {
         let mut data = self.data.lock().unwrap();
         if data.remove(key).is_some() {
             Ok(())
@@ -155,7 +138,7 @@ impl Datastore for MemoryDataStore {
         }
     }
 
-    fn expire(&mut self, key: &str, duration: Duration) -> Result<(), DatastoreError> {
+    pub fn expire(&mut self, key: &str, duration: Duration) -> Result<(), DatastoreError> {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get_mut(key) {
             item.expiry = Some(Instant::now() + duration);
@@ -165,7 +148,7 @@ impl Datastore for MemoryDataStore {
         }
     }
 
-    fn ttl(&self, key: &str) -> Result<Option<Duration>, DatastoreError> {
+    pub fn ttl(&self, key: &str) -> Result<Option<Duration>, DatastoreError> {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get(key) {
             if let Some(expiry) = item.expiry {
@@ -183,7 +166,7 @@ impl Datastore for MemoryDataStore {
         }
     }
 
-    fn modify<F>(&mut self, key: &str, modifier: F) -> Result<(), DatastoreError>
+    pub fn modify<F>(&mut self, key: &str, modifier: F) -> Result<(), DatastoreError>
     where
         F: FnOnce(&mut Value),
     {
@@ -199,12 +182,12 @@ impl Datastore for MemoryDataStore {
 
 }
 
-impl From<Vec<u8>> for MemoryStoreGuard {
+impl From<Vec<u8>> for DatastoreGuard {
     fn from(value: Vec<u8>) -> Self {
         let decoded = decode(&value).unwrap();
 
-        MemoryStoreGuard {
-            store: MemoryDataStore{
+        DatastoreGuard {
+            store: Datastore{
                 data: Arc::new(Mutex::new(decoded))
             }, 
             interval: None
@@ -215,10 +198,11 @@ impl From<Vec<u8>> for MemoryStoreGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::sleep;
 
     #[tokio::test]
     async fn test_set_and_get() {
-        let mut guard = MemoryStoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None).await;
         let mut datastore = guard.store();
         
 
@@ -231,7 +215,7 @@ mod tests {
         let mut sorted = BTreeMap::new();
         sorted.insert(1, "geez".to_owned());
 
-        let mut vals = vec![
+        let vals = vec![
             ("key1".to_owned(), Value::Text("value1".to_owned()), None),
             ("key2".to_owned(), Value::Text("value2".to_owned()), Some(Duration::from_secs(2))),
             ("key3".to_owned(), Value::List(list.clone()), None),
@@ -260,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove() {
-        let mut guard = MemoryStoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None).await;
         let mut datastore = guard.store();
 
         datastore.set("key1".to_owned(), Value::Text("value1".to_owned()), None);
@@ -274,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expire_and_ttl() {
-        let mut guard = MemoryStoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None).await;
         let mut datastore = guard.store();
 
         datastore.set("key1".to_owned(), Value::Text("value1".to_owned()), Some(Duration::from_secs(2)));
@@ -291,7 +275,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_modify_existing_key() {
-        let mut guard = MemoryStoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None).await;
         let mut datastore = guard.store();
         
         datastore.set("key".to_owned(), Value::Text("value".to_owned()), None);
@@ -308,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_decode() {
-        let mut guard = MemoryStoreGuard::new(None).await;
+        let guard = DatastoreGuard::new(None).await;
         let mut datastore = guard.store();
 
         let (key, value) = ("key", Value::Text("value".to_owned()));
@@ -334,21 +318,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_backup() {
-        let backup_interval = Duration::from_secs(5); // Backup interval of 5 seconds
-        let data = vec![1, 2, 3, 4, 5]; // Example data to be backed up
+        let backup_interval = Duration::from_secs(1);
+        let data = String::from("data");
 
-        // Create an instance of your struct, assuming it's called `BackupManager`
-        let guard = MemoryStoreGuard::new(Some(backup_interval)).await;
-        // let data_store = store
+        let guard = DatastoreGuard::new(Some(backup_interval)).await;
+        let mut store = guard.store();
+        store.set("data".to_owned(), Value::Text(data), None);
 
-        // Spawn the backup task
         guard.run_backup();
 
-        // Sleep for a while to allow the backup task to run
-        sleep(Duration::from_secs(10)).await;
-
-        // Perform assertions or checks here to verify that the backup task executed as expected.
-        // For example, you could check if the backup file was created or if the data was saved.
+        sleep(Duration::from_secs(2)).await;
 
         // Assert that the backup file was created
         let backup_file_exists = std::path::Path::new("./backup/backup.efs").exists();
