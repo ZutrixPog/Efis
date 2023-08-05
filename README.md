@@ -31,6 +31,8 @@ Efis supports the following commands:
 - `SMEMBERS <key>`: Get all elements of a set.
 - `ZADD <key> <value>`: Add elements to a sorted set with a numeric score.
 - `ZRANGE <key> <start> <end>`: Get a range of elements from a sorted set.
+- `PUBLISH <channel> <message>`: Publish a message on the specified channel.
+- `SUBSCRIBE <channel>`: Subscribes to the specified channel. Messages are sent on the same tcp connection.
 
 It would be a great exercise reading the code and trying to find out more about commands and the underlying protocol. :D
 
