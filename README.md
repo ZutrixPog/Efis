@@ -16,21 +16,21 @@ Efis is a lightweight and efficient key-value store written in Rust. It provides
 
 Efis supports the following commands:
 
-- `SET`: Set a key-value pair in the store.
-- `GET`: Retrieve the value for a given key.
-- `DELETE`: Delete a key-value pair.
-- `INCREMENT`: Increment the value of a numeric key by 1.
-- `DECREMENT`: Decrement the value of a numeric key by 1.
-- `EXPIRE`: Set a time-to-live (TTL) for a key. The key will be automatically deleted after the specified time.
-- `TTL`: Get the remaining time-to-live for a key.
-- `LPUSH`: Insert elements at the beginning of a list.
-- `RPUSH`: Insert elements at the end of a list.
-- `LPOP`: Remove and return the first element of a list.
-- `RPOP`: Remove and return the last element of a list.
-- `SADD`: Add elements to a set.
-- `SMEMBERS`: Get all elements of a set.
-- `ZADD`: Add elements to a sorted set with a numeric score.
-- `ZRANGE`: Get a range of elements from a sorted set.
+- `SET <key> <value> <ttl>`: Set a key-value pair in the store.
+- `GET <key>`: Retrieve the value for a given key.
+- `DELETE <key>`: Delete a key-value pair.
+- `INCREMENT <key>`: Increment the value of a numeric key by 1.
+- `DECREMENT <key>`: Decrement the value of a numeric key by 1.
+- `EXPIRE <key> <ttl>`: Set a time-to-live (TTL) for a key. The key will be automatically deleted after the specified time.
+- `TTL <ttl>`: Get the remaining time-to-live for a key.
+- `LPUSH <key> <value>`: Insert elements at the beginning of a list.
+- `RPUSH <key> <value>`: Insert elements at the end of a list.
+- `LPOP <key>`: Remove and return the first element of a list.
+- `RPOP <key>`: Remove and return the last element of a list.
+- `SADD <key> <value>`: Add elements to a set.
+- `SMEMBERS <key>`: Get all elements of a set.
+- `ZADD <key> <value>`: Add elements to a sorted set with a numeric score.
+- `ZRANGE <key> <start> <end>`: Get a range of elements from a sorted set.
 
 It would be a great exercise reading the code and trying to find out more about commands and the underlying protocol. :D
 
@@ -63,6 +63,8 @@ you can modify the justfile to include your own prefrences.
 - modify `port` to the port number you want Efis to listen on.
 - modify `backup_path` to the path where Efis will store its backups.
 - modify `backup_interval` to your desired backup interval in seconds.
+
+The server runs on tcp and the commands are issued as tcp messages. you can use **netcat** to connect to the running server and test functionalities.
 
 ## How to build with Docker
 
