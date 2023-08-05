@@ -18,9 +18,9 @@ Efis supports the following commands:
 
 - `SET <key> <value> <ttl>`: Set a key-value pair in the store.
 - `GET <key>`: Retrieve the value for a given key.
-- `DELETE <key>`: Delete a key-value pair.
-- `INCREMENT <key>`: Increment the value of a numeric key by 1.
-- `DECREMENT <key>`: Decrement the value of a numeric key by 1.
+- `DEL <key>`: Delete a key-value pair.
+- `INCR <key>`: Increment the value of a numeric key by 1.
+- `DECR <key>`: Decrement the value of a numeric key by 1.
 - `EXPIRE <key> <ttl>`: Set a time-to-live (TTL) for a key. The key will be automatically deleted after the specified time.
 - `TTL <ttl>`: Get the remaining time-to-live for a key.
 - `LPUSH <key> <value>`: Insert elements at the beginning of a list.
