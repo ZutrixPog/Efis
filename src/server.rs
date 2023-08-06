@@ -139,7 +139,7 @@ impl Handler {
                 return Err(ServiceError::InvalidValueType);
             }
 
-            let command = parse_command(std::str::from_utf8(&buf).unwrap()).unwrap();
+            let command = parse_command(std::str::from_utf8(&buf).unwrap()).unwrap_or(("unknown", EfisCommand::Unknown("unknown command")));
             // TODO: there must be a cleaner way
             if let EfisCommand::Subscribe(chan) = command.1 {
                 let mut sub = self.svc.pubsub.subscribe(chan.to_owned());

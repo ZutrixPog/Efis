@@ -1,6 +1,7 @@
 use nom::{
     branch::alt,
     bytes::complete::tag,
+    bytes::streaming::take_while1,
     character::complete::{char, digit1, none_of},
     combinator::{map_res, recognize, opt},
     multi::{separated_list1, many0, many1},
@@ -59,7 +60,7 @@ fn parse_set_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, _) = parse_whitespace(input)?;
     let (input, key) = parse_token(input)?;
     let (input, _) = parse_whitespace(input)?;
-    let (input, value) = parse_token(input)?;
+    let (input, value) = parse_quoted_value(input).or(parse_token(input))?;
     let (input, ttl) = parse_ex_option(input)?;
     Ok((input, EfisCommand::Set(key, value, ttl)))
 }
@@ -211,6 +212,13 @@ fn parse_whitespace(input: &str) -> IResult<&str, &str> {
 
 fn parse_token(input: &str) -> IResult<&str, &str> {
     recognize(many1(none_of(" \t\r\n")))(input)
+}
+
+fn parse_quoted_value(input: &str) -> IResult<&str, &str> {
+    let (input, _) = char('"')(input)?;
+    let (input, value) = recognize(take_while1(|c| c != '"'))(input)?;
+    let (input, _) = char('"')(input)?;
+    Ok((input, value))
 }
 
 fn parse_token_list(input: &str) -> IResult<&str, Vec<&str>> {

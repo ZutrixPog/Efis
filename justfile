@@ -6,14 +6,14 @@ build:
     cargo build --release
 
 build-image:
-    sudo docker build -t efis .
+    docker build -t efis .
     docker tag efis erfansafari/efis:latest
 
-release: build-image
+release:
     docker push erfansafari/efis:latest
 
-run:
-    PORT={{port}} BACKUP_PATH={{backup_path}} BACKUP_INTERVAL={{backup_interval}} cargo run
+run: build
+    port={{port}} BACKUP_PATH={{backup_path}} BACKUP_INTERVAL={{backup_interval}} ./target/release/efis
 
 run-docker:
-    docker run --env PORT={{port}} --env BACKUP_PATH={{backup_path}} --env BACKUP_INTERVAL={{backup_interval}} your_image_name
+    docker run --env PORT={{port}} --env BACKUP_PATH={{backup_path}} --env BACKUP_INTERVAL={{backup_interval}} efis

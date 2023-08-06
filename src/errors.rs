@@ -32,7 +32,9 @@ pub enum ServiceError {
     InvalidValueType,
     #[error("Service: specified key is expired.")]
     KeyExpired,
-    #[error("Service: couldn't decrement value.")]
+    #[error("Service: unknown command.")]
+    UnknownCommand,
+    #[error("Service: internal error.")]
     Other(String),
 }
 

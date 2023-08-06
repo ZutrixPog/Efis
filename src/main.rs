@@ -10,9 +10,9 @@ use tokio::net::TcpListener;
 #[allow(non_snake_case)]
 #[derive(Deserialize, Debug)]
 struct Config{
-    PORT: String,
-    BACKUP_INTERVAL: Option<u64>,
-    BACKUP_PATH: Option<String>,
+    port: String,
+    backup_interval: Option<u64>,
+    backup_path: Option<String>,
 }
 
 #[tokio::main]
@@ -23,12 +23,12 @@ pub async fn main() -> anyhow::Result<()> {
     subscriber::set_global_default(subscriber)?;
 
     let mut backup_dur = None;
-    if let Some(interval) = config.BACKUP_INTERVAL {
+    if let Some(interval) = config.backup_interval {
         backup_dur = Some(Duration::from_secs(interval));
     }
 
-    let listener = TcpListener::bind(&format!("127.0.0.1:{}", config.PORT)).await?;
-    server::run(listener, signal::ctrl_c(), backup_dur, config.BACKUP_PATH).await;
+    let listener = TcpListener::bind(&format!("127.0.0.1:{}", config.port)).await?;
+    server::run(listener, signal::ctrl_c(), backup_dur, config.backup_path).await;
 
     Ok(())
 }

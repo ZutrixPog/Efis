@@ -59,7 +59,7 @@ impl EfisService {
             EfisCommand::ZAdd(key, member, score) => self.zadd(key, member, score).and(ok_res),
             EfisCommand::ZRange(key, start, stop) => self.zrange(key, start, stop),
             EfisCommand::Publish(channel, message) => self.publish(channel, message).and(ok_res),
-            _ => Err(ServiceError::Other("Command not found".to_string())),
+            _ => Err(ServiceError::UnknownCommand),
         }
     }
 }

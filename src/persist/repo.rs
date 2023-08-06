@@ -1,8 +1,8 @@
 use std::path::{PathBuf, Path};
-use thiserror::__private::PathAsDisplay;
 use tokio::fs::{self, File, OpenOptions};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::error;
 
 use crate::errors::PersistError;
 
@@ -15,7 +15,7 @@ pub struct FileBackupRepo {
 
 impl FileBackupRepo {
     pub fn new(path: PathBuf) -> Self {
-        let _ = fs::create_dir_all(path.clone());
+        let _ = std::fs::create_dir_all(path.clone());
         Self {
             path
         }
@@ -25,27 +25,27 @@ impl FileBackupRepo {
         let path = self.path.join(FILE_NAME);
         let tmp_path =  self.path.join(generate_tmp_name());
         let tmp = Path::new(&tmp_path);
-        println!("{}", tmp.as_display());
         let mut fp = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(tmp).await
             .map_err(|err| {
-                println!("{}", err);
+                error!("{}", err.to_string());
                 PersistError::ErrorSave
             })?;
 
         if let Err(_) = fp.write_all(&data).await {
             fs::remove_file(tmp).await.map_err(|_| PersistError::ErrorSave)?;
+            return Err(PersistError::ErrorSave);
         }
         
         if let Err(_) = fp.sync_all().await {
             fs::remove_file(tmp).await.map_err(|_| PersistError::ErrorSave)?;
+            return Err(PersistError::ErrorSave);
         }
-
-        fs::rename(tmp, Path::new(&path)).await.map_err(|_| PersistError::ErrorSave)?;
-        fs::remove_file(tmp).await.map_err(|_| PersistError::ErrorSave)
+    
+        fs::rename(tmp, Path::new(&path)).await.map_err(|err| {println!("{}", err.to_string());PersistError::ErrorSave})
     }
     
     pub async fn retrieve(&self) -> Result<Vec<u8>, PersistError> {
