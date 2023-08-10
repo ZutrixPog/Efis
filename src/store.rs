@@ -1,7 +1,7 @@
-use tokio::time::{Duration, Instant};
+use tokio::time::{Duration, Instant, interval};
+use tokio::sync::broadcast;
 use std::sync::{Arc, Mutex};
 use std::convert::From;
-use std::thread;
 use std::collections::{VecDeque, HashSet, BTreeMap, HashMap};
 use std::cmp::PartialEq;
 use std::path::Path;
@@ -36,23 +36,24 @@ pub struct DatastoreGuard {
     store: Datastore,
     interval: Option<Duration>,
     path: Option<String>,
+    notify_shutdown: Option<broadcast::Sender<()>>,
 }
 
 impl DatastoreGuard {
     pub async fn new(interval: Option<Duration>, path: Option<String>) -> Self {
         let repo = FileBackupRepo::new(Path::new(&path.clone().unwrap_or(PATH.to_string())).to_path_buf());
         
-        let guard = if let Ok(data) = repo.retrieve().await {
+        let mut guard = if let Ok(data) = repo.retrieve().await {
             info!("reading data from backup.");
             let mut g = DatastoreGuard::from(data);
             g.interval = interval;
             g.path = path;
             g
         } else {
-            Self { store: Datastore::new(), interval, path }
+            Self { store: Datastore::new(), interval, path, notify_shutdown: None }
         };
         
-        if guard.interval.is_some() {
+        if guard.interval.is_some() && guard.path.is_some() {
             guard.run_backup();
         }
         guard
@@ -62,7 +63,7 @@ impl DatastoreGuard {
         self.store.clone()
     }
 
-    pub fn run_backup(&self) {
+    pub fn run_backup(&mut self) {
         if self.interval.is_none() {
             return;
         }
@@ -70,26 +71,44 @@ impl DatastoreGuard {
         let dur = self.interval.unwrap().clone();
         let data = self.store();
         let path = self.path.clone().unwrap();
+
+        let (notify, mut receiver) = broadcast::channel(1);
+        self.notify_shutdown = Some(notify);
         tokio::spawn(async move {
             let repo = FileBackupRepo::new(Path::new(&path).to_path_buf());
-            
+            let mut inter = interval(dur);
+        
             loop {
-                thread::sleep(dur);
-                
-                info!("backup data persisted on disk.");
-                let data = data.encode().unwrap();
-                if let Err(err) = repo.save(data).await {
-                    error!("backup service stopped: {}", err.to_string());
-                    return;
+                tokio::select! {
+                    _ = receiver.recv() => {
+                        info!("persisting data before exiting...");
+                        backup(&data, &repo).await;
+                        return;
+                    },
+                    _ = inter.tick() => {
+                        backup(&data, &repo).await;
+                    }
                 }
             }
         });
     }
 }
 
+async fn backup(data: &Datastore, repo: &FileBackupRepo) {
+    info!("backup data persisted on disk.");
+    let data = data.encode().unwrap();
+    if let Err(err) = repo.save(data).await {
+        error!("backup service stopped: {}", err.to_string());
+        return;
+    }
+}
+
 impl Drop for DatastoreGuard {
     fn drop(&mut self) {
         self.store.shutdown_purge_task();
+        if let Some(sender) = self.notify_shutdown.clone() {
+            let _ = sender.send(());
+        }
     }
 }
 
@@ -113,6 +132,7 @@ impl Datastore {
     
     pub fn shutdown_purge_task(&self) {
         let state = self.data.lock().unwrap();
+        
         drop(state);
     }
 }
@@ -207,6 +227,7 @@ impl From<Vec<u8>> for DatastoreGuard {
             }, 
             interval: None,
             path: None,
+            notify_shutdown: None,
         }
     }
 }
@@ -337,11 +358,9 @@ mod tests {
         let backup_interval = Duration::from_secs(1);
         let data = String::from("data");
 
-        let guard = DatastoreGuard::new(Some(backup_interval), None).await;
+        let guard = DatastoreGuard::new(Some(backup_interval), Some(PATH.to_owned())).await;
         let mut store = guard.store();
         let _ = store.set("data".to_owned(), Value::Text(data), None);
-
-        guard.run_backup();
 
         sleep(Duration::from_secs(2)).await;
 

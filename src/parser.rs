@@ -190,7 +190,7 @@ fn parse_publish_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, _) = parse_whitespace(input)?;
     let (input, channel) = parse_token(input)?;
     let (input, _) = parse_whitespace(input)?;
-    let (input, message) = parse_token(input)?;
+    let (input, message) = parse_quoted_value(input).or(parse_token(input))?;
     Ok((input, EfisCommand::Publish(channel, message)))
 }
 

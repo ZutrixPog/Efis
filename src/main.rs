@@ -27,7 +27,7 @@ pub async fn main() -> anyhow::Result<()> {
         backup_dur = Some(Duration::from_secs(interval));
     }
 
-    let listener = TcpListener::bind(&format!("127.0.0.1:{}", config.port)).await?;
+    let listener = TcpListener::bind(&format!("0.0.0.0:{}", config.port)).await?;
     server::run(listener, signal::ctrl_c(), backup_dur, config.backup_path).await;
 
     Ok(())

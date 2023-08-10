@@ -74,11 +74,11 @@ To run Efis using Docker, follow these step:
 
 1. Build the Docker image:
 ```
-just build-image
+docker build -t erfansafari/efis .
 ```
 2. Run the Efis container:
 ```
-just run-docker
+docker run --env "PORT=YOUR-PORT" --env "BACKUP_PATH=YOUR-PATH" --env "BACKUP_INTERVAL=YOUR-INTERVAL" -p PORT:PORT erfansafari/efis
 ```
 
 ## How to run with docker

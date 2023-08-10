@@ -18,9 +18,9 @@ RUN cargo build --release --target x86_64-unknown-linux-musl
 FROM debian:buster-slim
 
 # Set environment variables
-ENV PORT=8080 \
-    BACKUP_PATH=./backup \
-    BACKUP_INTERVAL=120
+ENV PORT 8080
+ENV BACKUP_PATH ./backup 
+ENV BACKUP_INTERVAL 120
 
 WORKDIR /app
 
@@ -28,7 +28,7 @@ WORKDIR /app
 COPY --from=builder /usr/src/efis/target/x86_64-unknown-linux-musl/release/efis .
 
 # Expose the port on which Efis listens
-EXPOSE $PORT
+EXPOSE ${PORT}
 
 # Run the Efis server
 CMD ["./efis"]

@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio::time::{self, Duration};
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 use crate::errors::ServiceError;
 use crate::pubsub::PubSubGuard;
@@ -71,7 +71,6 @@ pub async fn run(listener: TcpListener, shutdown: impl Future, backup_dur: Optio
 
 impl Listener {
     async fn run(&mut self) -> anyhow::Result<()> {
-        println!("");
         info!("accepting connections");
 
         loop {
@@ -96,7 +95,7 @@ impl Listener {
 
             tokio::spawn(async move {
                 if let Err(err) = handler.run().await {
-                    error!(cause = ?err, "connection error");
+                    warn!(cause = ?err, "Disconnected");
                 }
                 drop(permit);
             });
@@ -152,7 +151,13 @@ impl Handler {
                 }
             }
             let res = self.svc.process_cmd(command.1);
-            let mut res = if let Err(err) = res {err.to_string()} else {res.unwrap()};
+            let mut res = if let Err(err) = res {
+                error!("Command was executed with Error {}", err.to_string());
+                err.to_string()
+            } else {
+                info!("Command was executed without Error");
+                res.unwrap()
+            };
             res.push_str("\n");
             let _ = self.socket.write((res).as_bytes()).await;
         }
