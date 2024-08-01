@@ -1,10 +1,11 @@
-use tokio::time::{Duration, Instant, interval};
+use tokio::time::{Duration, interval};
 use tokio::sync::broadcast;
 use std::sync::{Arc, Mutex};
 use std::convert::From;
 use std::collections::{VecDeque, HashSet, BTreeMap, HashMap};
 use std::cmp::PartialEq;
 use std::path::Path;
+use std::time::SystemTime;
 use tracing::{info, error};
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +28,7 @@ pub enum Value {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 struct Item {
     value: Value,
-    #[serde(skip)]
-    expiry: Option<Instant>,
+    expiry: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -141,7 +141,7 @@ impl Datastore {
     pub fn set(&mut self, key: String, value: Value, expiry: Option<Duration>) -> Result<(), DatastoreError> {
         let item = Item {
             value: value,
-            expiry: expiry.map(|d| Instant::now() + d),
+            expiry: expiry.map(|d| SystemTime::now() + d),
         };
         let mut data = self.data.lock().unwrap();
         data.entry(key).or_insert(item);
@@ -152,7 +152,7 @@ impl Datastore {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get(key) {
             if let Some(expiry) = item.expiry {
-                if expiry <= Instant::now() {
+                if expiry <= SystemTime::now() {
                     data.remove(key);
                     return None;
                 }
@@ -176,7 +176,7 @@ impl Datastore {
     pub fn expire(&mut self, key: &str, duration: Duration) -> Result<(), DatastoreError> {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get_mut(key) {
-            item.expiry = Some(Instant::now() + duration);
+            item.expiry = Some(SystemTime::now() + duration);
             Ok(())
         } else {
             Err(DatastoreError::KeyNotFound)
@@ -187,12 +187,16 @@ impl Datastore {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get(key) {
             if let Some(expiry) = item.expiry {
-                let now = Instant::now();
+                let now = SystemTime::now();
                 if now >= expiry {
                     data.remove(key);
                     return Err(DatastoreError::KeyExpired);
                 }
-                Ok(Some(expiry - now))
+                if let Ok(duration) = expiry.duration_since(now) {
+                    Ok(Some(duration))
+                } else {
+                    Ok(None)
+                }
             } else {
                 Ok(None)
             }

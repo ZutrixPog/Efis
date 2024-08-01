@@ -2,54 +2,54 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum FsError {
-    #[error("couldn't write to disk")]
+    #[error("WriteFailed couldn't write to disk")]
     WriteFailed,
-    #[error("couldn't read from disk")]
+    #[error("ReadFailed couldn't read from disk")]
     ReadFailed
 }
 
 #[derive(Error, Debug, PartialEq)]
 pub enum DatastoreError {
-    #[error("Key doesnt exists")]
+    #[error("KeyNotFound Key doesnt exists")]
     KeyNotFound,
-    #[error("Key-value is expired")]
+    #[error("KeyExpired Key-value is expired")]
     KeyExpired,
-    #[error("There is something wrong")]
+    #[error("Other There is something wrong")]
     Other(String),
 }
 
 #[derive(Error, Debug, PartialEq)]
 pub enum ServiceError {
-    #[error("Service: couldn't find the key")]
+    #[error("KeyNotFound couldn't find the key")]
     KeyNotFound,
-    #[error("Service: couldn't write value in data store.")]
+    #[error("ErrorWrite couldn't write value in data store")]
     ErrorWrite,
-    #[error("Service: couldn't publish value on this channel (no listener)")]
+    #[error("ErrorPublish couldn't publish value on this channel (no listener)")]
     ErrorPublish,
-    #[error("Service: couldn't subscribe to the channel")]
+    #[error("ErrorSubscribe couldn't subscribe to the channel")]
     ErrorSubscribe,
-    #[error("Service: value specified to the key is not valid.")]
+    #[error("InvalidValueType value specified to the key is not valid")]
     InvalidValueType,
-    #[error("Service: specified key is expired.")]
+    #[error("KeyExpired specified key is expired")]
     KeyExpired,
-    #[error("Service: unknown command.")]
+    #[error("UnknownCommand unknown command")]
     UnknownCommand,
-    #[error("Service: internal error.")]
+    #[error("Internal internal error")]
     Other(String),
 }
 
 #[derive(Error, Debug, PartialEq)]
 pub enum SerializerError {
-    #[error("couldn't processed specified type.")]
+    #[error("InvalidValueType couldn't processed specified type.")]
     InvalidValueType,
 }
 
 #[derive(Error, Debug, PartialEq)]
 pub enum PersistError {
-    #[error("couldn't save data.")]
+    #[error("ErrorSave couldn't save data.")]
     ErrorSave,
-    #[error("couldn't read data.")]
+    #[error("ErrorRead couldn't read data.")]
     ErrorRead,
-    #[error("couldn't find backup data.")]
+    #[error("ErrorNoBackup couldn't find backup data.")]
     ErrorNoBackup,
 }

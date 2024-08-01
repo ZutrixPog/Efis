@@ -1,5 +1,5 @@
 port := '8080'
-backup_interval := '120'
+backup_interval := '20'
 backup_path := './backup'
 
 build:

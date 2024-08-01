@@ -1,38 +1,20 @@
 use std::collections::{HashSet, VecDeque, BTreeMap};
 
 use tokio::time::Duration;
+use tokio::sync::mpsc::Sender;
 
-use crate::parser::EfisCommand;
 use crate::store::{Value, Datastore};
 use crate::pubsub::PubSub;
 use crate::errors::{ServiceError, DatastoreError};
-
-pub trait Service {
-    fn set(&mut self, key: &str, value: &str, exp: Option<u64>) -> Result<(), ServiceError>;
-    fn get(&self, key: &str) -> Result<String, ServiceError>;
-    fn delete(&mut self, key: &str) -> Result<(), ServiceError>;
-    fn increment(&mut self, key: &str) -> Result<String, ServiceError>;
-    fn decrement(&mut self, key: &str) -> Result<String, ServiceError>;
-    fn expire(&mut self, key: &str, duration: u64) -> Result<(), ServiceError>;
-    fn ttl(&self, key: &str) -> Result<String, ServiceError>;
-    fn lpush(&mut self, key: &str, values: Vec<&str>) -> Result<(), ServiceError>;
-    fn rpush(&mut self, key: &str, values: Vec<&str>) -> Result<(), ServiceError>;
-    fn lpop(&mut self, key: &str) -> Result<String, ServiceError>;
-    fn rpop(&mut self, key: &str) -> Result<String, ServiceError>;
-    fn sadd(&mut self, key: &str, values: Vec<&str>) -> Result<(), ServiceError>;
-    fn smembers(&self, key: &str) -> Result<String, ServiceError>;
-    fn zadd(&mut self, key: &str, score: &str, value: &str) -> Result<(), ServiceError>;
-    fn zrange(&self, key: &str, start: u64, end: u64) -> Result<String, ServiceError>;
-    fn publish(&mut self, key: &str, value: &str) -> Result<(), ServiceError>;
-}
+use crate::parser::{parse_command, EfisCommand};
 
 #[derive(Debug)]
-pub struct EfisService {
+pub struct Efis {
     store: Datastore,
     pub pubsub: PubSub,
 }
 
-impl EfisService {
+impl Efis {
     pub fn new(ds: Datastore, ps: PubSub) -> Self {
         Self {
             store: ds,
@@ -40,16 +22,34 @@ impl EfisService {
         }
     }
 
-    pub fn process_cmd(&mut self, cmd: EfisCommand) -> Result<String, ServiceError> {
-        let ok_res = Ok("ok".to_string());
-        match cmd {
+    pub async fn process_cmd(&mut self, cmd_str: &str, res_chan: Sender<String>) -> Result<String, ServiceError> {
+        let command = parse_command(cmd_str).unwrap_or(("unknown", EfisCommand::Unknown("unknown command")));
+        
+        if let EfisCommand::Subscribe(chan) = command.1 {
+            let mut sub = self.pubsub.subscribe(chan.to_owned());
+            tokio::spawn(async move{
+                while let Ok(mut msg) = sub.recv().await {
+                    if msg.contains("unsub") {
+                        break;
+                    }
+                    msg.push('\n');
+                    
+                    let _ = res_chan.send(msg).await;
+                }
+            });
+
+            return Ok("PS".to_string());
+        }
+
+        let ok_res = Ok("OK".to_string());
+        match command.1 {
             EfisCommand::Set(key, value, expiration) => self.set(key, value, expiration).and(ok_res),
             EfisCommand::Get(key) => self.get(key),
             EfisCommand::Del(key) => self.delete(key).and(ok_res),
             EfisCommand::Incr(key) => self.increment(key).and(ok_res),
             EfisCommand::Decr(key) => self.decrement(key).and(ok_res),
             EfisCommand::Expire(key, expiration) => self.expire(key, expiration).and(ok_res),
-            EfisCommand::TTL(key) => self.ttl(key).and(ok_res),
+            EfisCommand::TTL(key) => self.ttl(key),
             EfisCommand::LPush(key, values) => self.lpush(key, values).and(ok_res),
             EfisCommand::RPush(key, values) => self.rpush(key, values).and(ok_res),
             EfisCommand::LPop(key) => self.lpop(key),
@@ -62,9 +62,7 @@ impl EfisService {
             _ => Err(ServiceError::UnknownCommand),
         }
     }
-}
 
-impl Service for EfisService {
     fn set(&mut self, key: &str, value: &str, exp: Option<u64>) -> Result<(), ServiceError> {
         let duration = exp.map(Duration::from_secs);
         self.store.set(key.to_string(), Value::Text(value.to_string()), duration)
@@ -280,12 +278,12 @@ mod tests {
     use crate::store::DatastoreGuard;
     use crate::pubsub::PubSubGuard;
 
-    async fn setup() -> EfisService {
+    async fn setup() -> Efis {
         let guard = DatastoreGuard::new(None, None).await;
         let store = guard.store();
         let pguard = PubSubGuard::new();
         let pubsub = pguard.ps();
-        EfisService::new(store, pubsub)
+        Efis::new(store, pubsub)
     }
 
     #[tokio::test]

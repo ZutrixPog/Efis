@@ -8,9 +8,8 @@ use tracing::{error, info, instrument, warn};
 
 use crate::errors::ServiceError;
 use crate::pubsub::PubSubGuard;
-use crate::service::EfisService;
+use crate::efis::Efis;
 use crate::store::DatastoreGuard;
-use crate::parser::{parse_command, EfisCommand};
 
 struct Listener {
     datastore_holder: DatastoreGuard,
@@ -23,7 +22,7 @@ struct Listener {
 
 #[derive(Debug)]
 struct Handler {
-    svc: EfisService,
+    svc: Efis,
     socket: TcpStream,
     shutdown: Shutdown,
     _shutdown_complete: mpsc::Sender<()>,
@@ -87,7 +86,7 @@ impl Listener {
             let pubsub = self.pubsub_holder.ps();
 
             let mut handler = Handler {
-                svc: EfisService::new(store, pubsub),
+                svc: Efis::new(store, pubsub),
                 socket: socket,
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
                 _shutdown_complete: self.shutdown_complete_tx.clone(),
@@ -138,25 +137,30 @@ impl Handler {
                 return Err(ServiceError::InvalidValueType);
             }
 
-            let command = parse_command(std::str::from_utf8(&buf).unwrap()).unwrap_or(("unknown", EfisCommand::Unknown("unknown command")));
-            // TODO: there must be a cleaner way
-            if let EfisCommand::Subscribe(chan) = command.1 {
-                let mut sub = self.svc.pubsub.subscribe(chan.to_owned());
-                while let Ok(msg) = sub.recv().await {
-                    if msg.contains("exit") {
-                        break;
-                    }
-    
-                    let _ = self.socket.write(msg.as_bytes()).await;
-                }
-            }
-            let res = self.svc.process_cmd(command.1);
+            let command_str = std::str::from_utf8(&buf).unwrap_or("");
+            let (tx, mut rx) = mpsc::channel(1024);
+            let res = self.svc.process_cmd(command_str, tx).await;
+
             let mut res = if let Err(err) = res {
-                error!("Command was executed with Error {}", err.to_string());
-                err.to_string()
+                if command_str.contains("FIN") {
+                    return Ok(());
+                } else if err == ServiceError::UnknownCommand {
+                    error!("Command was executed with Error {}", err.to_string());
+                } else {
+                    error!("Command {} was executed with Error {}", command_str, err.to_string());
+                }
+                format!("ERR {}", err)
             } else {
-                info!("Command was executed without Error");
-                res.unwrap()
+                info!("Command {} was executed without Error", command_str);
+                let response = res.unwrap();
+                if response == "PS".to_string() {
+                    while let Some(msg) = rx.recv().await {
+                        let _ = self.socket.write(msg.as_bytes()).await;
+                    }
+                    continue;
+                }
+
+                response
             };
             res.push_str("\n");
             let _ = self.socket.write((res).as_bytes()).await;
