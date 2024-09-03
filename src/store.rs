@@ -10,7 +10,7 @@ use tracing::{info, error};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::*;
-use crate::persist::repo::FileBackupRepo;
+use crate::storage::backup::FileBackupRepo;
 use crate::serializer::{encode, decode};
 
 

@@ -1,3 +1,4 @@
+use crate::consensus::AppendEntries;
 use nom::{
     branch::alt,
     bytes::complete::tag,
@@ -28,6 +29,10 @@ pub enum EfisCommand<'a> {
     ZRange(&'a str, u64, u64),
     Publish(&'a str, &'a str),
     Subscribe(&'a str),
+    RequestVote(u64, u64, u64, u64),
+    Vote(u64, bool),
+    AppendEntries(AppendEntries),
+    AckEntries(u64, bool, u64, u64),
     Unknown(&'a str),
 }
 
@@ -199,6 +204,58 @@ fn parse_subscribe_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, _) = parse_whitespace(input)?;
     let (input, channel) = parse_token(input)?;
     Ok((input, EfisCommand::Subscribe(channel)))
+}
+
+fn parse_request_vote(input: &str) -> IResult<&str, EfisCommand> {
+   let (input, _) = tag("RV")(input)?; 
+   let (input, _) = parse_whitespace(input)?;
+   let (input, term) = parse_number(input)?;
+   let (input, _) = parse_whitespace(input)?;
+   let (input, candidate_id) = parse_number(input)?;
+   let (input, _) = parse_whitespace(input)?;
+   let (input, last_log_index) = parse_number(input)?;
+   let (input, _) = parse_whitespace(input)?;
+   let (input, last_log_term) = parse_number(input)?;
+
+    Ok((input, EfisCommand::RequestVote(term, candidate_id, last_log_index, last_log_term)))
+}
+
+fn parse_vote(input: &str) -> IResult<&str, EfisCommand> {
+   let (input, _) = tag("VOTE")(input)?; 
+   let (input, _) = parse_whitespace(input)?;
+   let (input, term) = parse_number(input)?;
+   let (input, _) = parse_whitespace(input)?;
+   let (input, voted) = parse_number(input)?;
+
+   let voted = if voted > 0 {true} else {false};
+
+   Ok((input, EfisCommand::Vote(term, voted)))   
+}
+
+fn parse_append_entries(input: &str) -> IResult<&str, EfisCommand> {
+    let (input, _) = tag("AE")(input)?;
+    let (input, _) = parse_whitespace(input)?;
+    let (input, args_json) = parse_token(input)?;
+
+    let args = serde_json::from_str(args_json).unwrap_or(AppendEntries{..Default::default()});
+
+    Ok((input, EfisCommand::AppendEntries(args)))
+}
+
+fn parse_ack_entries(input: &str) -> IResult<&str, EfisCommand> {
+   let (input, _) = tag("ACKE")(input)?; 
+   let (input, _) = parse_whitespace(input)?;
+   let (input, term) = parse_number(input)?;
+   let (input, _) = parse_whitespace(input)?;
+   let (input, success) = parse_number(input)?;
+   let (input, _) = parse_whitespace(input)?;
+   let (input, conflict_index) = parse_number(input)?;
+   let (input, _) = parse_whitespace(input)?;
+   let (input, conflict_term) = parse_number(input)?;
+
+   let success = if success > 0 {true} else {false};
+
+   Ok((input, EfisCommand::AckEntries(term, success, conflict_index, conflict_term)))
 }
 
 fn parse_unknown_command(input: &str) -> IResult<&str, EfisCommand> {

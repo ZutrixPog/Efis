@@ -5,5 +5,6 @@ pub mod efis;
 pub mod store;
 pub mod server;
 mod consensus;
-mod persist;
+mod storage;
 mod serializer;
+mod client;

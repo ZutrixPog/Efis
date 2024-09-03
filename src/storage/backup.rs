@@ -80,7 +80,7 @@ fn generate_tmp_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::persist::repo::*;
+    use crate::storage::backup::*;
     use tempfile::tempdir;
 
     #[tokio::test]

@@ -53,3 +53,9 @@ pub enum PersistError {
     #[error("ErrorNoBackup couldn't find backup data.")]
     ErrorNoBackup,
 }
+
+#[derive(Error, Debug, PartialEq)]
+pub enum ConsensusError {
+    #[error("DeadNode node is dead")]
+    DeadNode,
+}
