@@ -1,10 +1,14 @@
-use crate::{consensus::{PersistentState, Storage}, errors::PersistError, serializer::{decode, encode}};
+use crate::{
+    consensus::{PersistentState, Storage},
+    errors::PersistError,
+    serializer::{decode, encode},
+};
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use tracing::{info, error, warn, debug};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{debug, error, info, warn};
 
 const FILE_NAME: &str = "cons";
 
@@ -14,11 +18,7 @@ pub struct ConFileStorage {
 
 impl ConFileStorage {
     pub fn new(filepath: PathBuf) -> Arc<dyn Storage + Sync + Send> {
-        Arc::new(
-            ConFileStorage {
-                path: filepath,
-            }
-        )    
+        Arc::new(ConFileStorage { path: filepath })
     }
 }
 
@@ -30,24 +30,25 @@ impl Storage for ConFileStorage {
             .read(true)
             .write(true)
             .create(true)
-            .open(path).await
+            .open(path)
+            .await
             .map_err(|err| {
                 error!("{}", err.to_string());
                 PersistError::ErrorSave
             })?;
-        
-        let data = encode(state)?; 
+
+        let data = encode(state)?;
 
         fp.write_all(&data).await?;
         fp.sync_all().await?;
-   
+
         Ok(())
-    } 
+    }
 
     async fn restore(&self) -> anyhow::Result<PersistentState> {
         let file_path = self.path.join(FILE_NAME);
         let mut file = File::open(&file_path).await?;
-        
+
         let mut contents = Vec::new();
         file.read_to_end(&mut contents).await?;
 
@@ -63,17 +64,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_restore() {
-        let test_state = PersistentState{
+        let test_state = PersistentState {
             current_term: 1,
-            voted_for: Some(3), 
+            voted_for: 3,
             logs: vec![],
         };
 
-        let storage = ConFileStorage::new(PathBuf::from("./")); 
+        let storage = ConFileStorage::new(PathBuf::from("./"));
         assert!(!storage.store(test_state.clone()).await.is_err());
 
         let restored = storage.restore().await;
 
-        assert_eq!(restored.unwrap(), test_state); 
+        assert_eq!(restored.unwrap(), test_state);
     }
 }

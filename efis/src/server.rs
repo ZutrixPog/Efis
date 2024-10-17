@@ -1,26 +1,30 @@
 use std::future::Future;
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Semaphore};
+use tokio::sync::{broadcast, mpsc, Notify, Semaphore};
 use tokio::time::{self, Duration};
 use tracing::{error, info, instrument, warn};
 
+use crate::consensus::Consensus;
 use crate::errors::ServiceError;
 use crate::pubsub::PubSubGuard;
 use crate::efis::Efis;
+use crate::storage::consensus::ConFileStorage;
 use crate::store::DatastoreGuard;
 
 struct Listener {
     datastore_holder: DatastoreGuard,
     pubsub_holder: PubSubGuard,
+    cons: Arc<Consensus>,
     listener: TcpListener,
     limit_connections: Arc<Semaphore>,
     notify_shutdown: broadcast::Sender<()>,
     shutdown_complete_tx: mpsc::Sender<()>,
 }
 
-#[derive(Debug)]
 struct Handler {
     svc: Efis,
     socket: TcpStream,
@@ -36,10 +40,17 @@ pub async fn run(listener: TcpListener, shutdown: impl Future, backup_dur: Optio
     let store = DatastoreGuard::new(backup_dur, persist_path).await;
     let pubsub = PubSubGuard::new();
 
+    // Consensus
+    let con_storage = ConFileStorage::new(PathBuf::from_str("/var/efis").unwrap()); 
+    let ready_ntf = Notify::new();
+    let (_, commit_chan_rx) = mpsc::channel(1024);
+    let cons = Consensus::new(0, vec![], con_storage, ready_ntf, commit_chan_rx).await;
+
     let mut server = Listener {
         listener,
         datastore_holder: store,
         pubsub_holder: pubsub,
+        cons,
         limit_connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         notify_shutdown,
         shutdown_complete_tx,
@@ -84,9 +95,10 @@ impl Listener {
 
             let store = self.datastore_holder.store();
             let pubsub = self.pubsub_holder.ps();
+            let cons = Arc::clone(&self.cons); 
 
             let mut handler = Handler {
-                svc: Efis::new(store, pubsub),
+                svc: Efis::new(store, pubsub, cons),
                 socket: socket,
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
                 _shutdown_complete: self.shutdown_complete_tx.clone(),

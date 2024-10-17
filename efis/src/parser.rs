@@ -4,8 +4,8 @@ use nom::{
     bytes::complete::tag,
     bytes::streaming::take_while1,
     character::complete::{char, digit1, none_of},
-    combinator::{map_res, recognize, opt},
-    multi::{separated_list1, many0, many1},
+    combinator::{map_res, opt, recognize},
+    multi::{many0, many1, separated_list1},
     sequence::preceded,
     IResult,
 };
@@ -59,9 +59,9 @@ pub fn parse_command(input: &str) -> IResult<&str, EfisCommand> {
     ))(input)
 }
 
-
 fn parse_set_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, _) = tag("SET")(input)?;
+
     let (input, _) = parse_whitespace(input)?;
     let (input, key) = parse_token(input)?;
     let (input, _) = parse_whitespace(input)?;
@@ -108,7 +108,9 @@ fn parse_expire_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, _) = tag("EXPIRE")(input)?;
     let (input, _) = parse_whitespace(input)?;
     let (input, key) = parse_token(input)?;
+
     let (input, _) = parse_whitespace(input)?;
+
     let (input, duration) = parse_number(input)?;
     Ok((input, EfisCommand::Expire(key, duration)))
 }
@@ -142,6 +144,7 @@ fn parse_lpop_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, _) = tag("LPOP")(input)?;
     let (input, _) = parse_whitespace(input)?;
     let (input, key) = parse_token(input)?;
+
     Ok((input, EfisCommand::LPop(key)))
 }
 
@@ -158,6 +161,7 @@ fn parse_sadd_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, key) = parse_token(input)?;
     let (input, _) = parse_whitespace(input)?;
     let (input, members) = parse_token_list(input)?;
+
     Ok((input, EfisCommand::SAdd(key, members)))
 }
 
@@ -176,6 +180,7 @@ fn parse_zadd_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, score) = parse_token(input)?;
     let (input, _) = parse_whitespace(input)?;
     let (input, member) = parse_token(input)?;
+
     Ok((input, EfisCommand::ZAdd(key, score, member)))
 }
 
@@ -192,9 +197,13 @@ fn parse_zrange_command(input: &str) -> IResult<&str, EfisCommand> {
 
 fn parse_publish_command(input: &str) -> IResult<&str, EfisCommand> {
     let (input, _) = tag("PUBLISH")(input)?;
+
     let (input, _) = parse_whitespace(input)?;
+
     let (input, channel) = parse_token(input)?;
+
     let (input, _) = parse_whitespace(input)?;
+
     let (input, message) = parse_quoted_value(input).or(parse_token(input))?;
     Ok((input, EfisCommand::Publish(channel, message)))
 }
@@ -207,29 +216,36 @@ fn parse_subscribe_command(input: &str) -> IResult<&str, EfisCommand> {
 }
 
 fn parse_request_vote(input: &str) -> IResult<&str, EfisCommand> {
-   let (input, _) = tag("RV")(input)?; 
-   let (input, _) = parse_whitespace(input)?;
-   let (input, term) = parse_number(input)?;
-   let (input, _) = parse_whitespace(input)?;
-   let (input, candidate_id) = parse_number(input)?;
-   let (input, _) = parse_whitespace(input)?;
-   let (input, last_log_index) = parse_number(input)?;
-   let (input, _) = parse_whitespace(input)?;
-   let (input, last_log_term) = parse_number(input)?;
+    let (input, _) = tag("RV")(input)?;
 
-    Ok((input, EfisCommand::RequestVote(term, candidate_id, last_log_index, last_log_term)))
+    let (input, _) = parse_whitespace(input)?;
+    let (input, term) = parse_number(input)?;
+    let (input, _) = parse_whitespace(input)?;
+    let (input, candidate_id) = parse_number(input)?;
+    let (input, _) = parse_whitespace(input)?;
+
+    let (input, last_log_index) = parse_number(input)?;
+    let (input, _) = parse_whitespace(input)?;
+
+    let (input, last_log_term) = parse_number(input)?;
+
+    Ok((
+        input,
+        EfisCommand::RequestVote(term, candidate_id, last_log_index, last_log_term),
+    ))
 }
 
 fn parse_vote(input: &str) -> IResult<&str, EfisCommand> {
-   let (input, _) = tag("VOTE")(input)?; 
-   let (input, _) = parse_whitespace(input)?;
-   let (input, term) = parse_number(input)?;
-   let (input, _) = parse_whitespace(input)?;
-   let (input, voted) = parse_number(input)?;
+    let (input, _) = tag("VOTE")(input)?;
+    let (input, _) = parse_whitespace(input)?;
 
-   let voted = if voted > 0 {true} else {false};
+    let (input, term) = parse_number(input)?;
+    let (input, _) = parse_whitespace(input)?;
+    let (input, voted) = parse_number(input)?;
 
-   Ok((input, EfisCommand::Vote(term, voted)))   
+    let voted = if voted > 0 { true } else { false };
+
+    Ok((input, EfisCommand::Vote(term, voted)))
 }
 
 fn parse_append_entries(input: &str) -> IResult<&str, EfisCommand> {
@@ -237,25 +253,31 @@ fn parse_append_entries(input: &str) -> IResult<&str, EfisCommand> {
     let (input, _) = parse_whitespace(input)?;
     let (input, args_json) = parse_token(input)?;
 
-    let args = serde_json::from_str(args_json).unwrap_or(AppendEntries{..Default::default()});
+    let args = serde_json::from_str(args_json).unwrap_or(AppendEntries {
+        ..Default::default()
+    });
 
     Ok((input, EfisCommand::AppendEntries(args)))
 }
 
 fn parse_ack_entries(input: &str) -> IResult<&str, EfisCommand> {
-   let (input, _) = tag("ACKE")(input)?; 
-   let (input, _) = parse_whitespace(input)?;
-   let (input, term) = parse_number(input)?;
-   let (input, _) = parse_whitespace(input)?;
-   let (input, success) = parse_number(input)?;
-   let (input, _) = parse_whitespace(input)?;
-   let (input, conflict_index) = parse_number(input)?;
-   let (input, _) = parse_whitespace(input)?;
-   let (input, conflict_term) = parse_number(input)?;
+    let (input, _) = tag("ACKE")(input)?;
+    let (input, _) = parse_whitespace(input)?;
+    let (input, term) = parse_number(input)?;
+    let (input, _) = parse_whitespace(input)?;
+    let (input, success) = parse_number(input)?;
+    let (input, _) = parse_whitespace(input)?;
+    let (input, conflict_index) = parse_number(input)?;
+    let (input, _) = parse_whitespace(input)?;
 
-   let success = if success > 0 {true} else {false};
+    let (input, conflict_term) = parse_number(input)?;
 
-   Ok((input, EfisCommand::AckEntries(term, success, conflict_index, conflict_term)))
+    let success = if success > 0 { true } else { false };
+
+    Ok((
+        input,
+        EfisCommand::AckEntries(term, success, conflict_index, conflict_term),
+    ))
 }
 
 fn parse_unknown_command(input: &str) -> IResult<&str, EfisCommand> {
@@ -294,15 +316,18 @@ fn parse_whitespace_then_number(input: &str) -> IResult<&str, u64> {
 mod tests {
     use super::*;
 
-
     #[test]
+
     fn test_parse_set_command_with_expiry() {
         let input = "SET mykey myvalue EX 60";
+
         let expected = Ok(("", EfisCommand::Set("mykey", "myvalue", Some(60))));
+
         assert_eq!(parse_command(input), expected);
     }
 
     #[test]
+
     fn test_parse_set_command_without_expiry() {
         let input = "SET mykey myvalue";
         let expected = Ok(("", EfisCommand::Set("mykey", "myvalue", None)));
@@ -341,10 +366,12 @@ mod tests {
     fn test_parse_expire_command() {
         let input = "EXPIRE mykey 60";
         let expected = Ok(("", EfisCommand::Expire("mykey", 60)));
+
         assert_eq!(parse_command(input), expected);
     }
 
     #[test]
+
     fn test_parse_ttl_command() {
         let input = "TTL mykey";
         let expected = Ok(("", EfisCommand::TTL("mykey")));
@@ -354,6 +381,7 @@ mod tests {
     #[test]
     fn test_parse_lpush_command() {
         let input = "LPUSH mylist value1 value2 value3";
+
         let expected = Ok((
             "",
             EfisCommand::LPush("mylist", vec!["value1", "value2", "value3"]),
@@ -374,6 +402,7 @@ mod tests {
     #[test]
     fn test_parse_lpop_command() {
         let input = "LPOP mylist";
+
         let expected = Ok(("", EfisCommand::LPop("mylist")));
         assert_eq!(parse_command(input), expected);
     }
@@ -382,10 +411,12 @@ mod tests {
     fn test_parse_rpop_command() {
         let input = "RPOP mylist";
         let expected = Ok(("", EfisCommand::RPop("mylist")));
+
         assert_eq!(parse_command(input), expected);
     }
 
     #[test]
+
     fn test_parse_sadd_command() {
         let input = "SADD myset value1 value2 value3";
         let expected = Ok((

@@ -59,3 +59,11 @@ pub enum ConsensusError {
     #[error("DeadNode node is dead")]
     DeadNode,
 }
+
+#[derive(Error, Debug, PartialEq)]
+pub enum RpcError {
+    #[error("internal server error")]
+    InternalError,
+    #[error("empty request")]
+    EmptyRequest,
+}
