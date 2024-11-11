@@ -12,22 +12,22 @@ pub type RpcFunc = dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<
     + 'static;
 
 pub struct Dispatcher {
-    methods: RwLock<HashMap<String, Arc<RpcFunc>>>,
+    methods: HashMap<String, Arc<RpcFunc>>,
 }
 
 impl Dispatcher {
-    pub fn new() -> Self {
-        Self {
-            methods: RwLock::new(HashMap::new()),
-        }
+    pub fn new() -> Arc<RwLock<Self>> {
+        Arc::new(RwLock::new(Self {
+            methods: HashMap::new(),
+        }))
     }
 
-    pub async fn register_fn(&self, method: String, rpc_fn: Arc<RpcFunc>) {
-        self.methods.write().await.insert(method, rpc_fn);
+    pub fn register_fn(&mut self, method: String, rpc_fn: Arc<RpcFunc>) {
+        self.methods.insert(method, rpc_fn);
     }
 
     // TODO: RpcStruct should be automatically implemented
-    pub fn register_struct(&self, st: &'static dyn RpcStruct) {
+    pub fn register_struct(&mut self, st: &'static dyn RpcStruct) {
         st.register_fns(self);
     }
 
@@ -36,11 +36,12 @@ impl Dispatcher {
         let mut parts = req_str.split(" ").collect::<Vec<&str>>();
         let method = parts.remove(0);
 
-        let methods = self.methods.read().await;
-        let rpc_fn = methods
+        println!("method {}", method);
+        let rpc_fn = self.methods
             .get(method)
             .ok_or_else(|| anyhow::anyhow!("Method not found"))?;
 
+        println!("before {}", parts.clone().join(" "));
         let response = rpc_fn(parts.join(" ")).await?;
 
         Ok(response.into_bytes())
@@ -92,7 +93,7 @@ mod tests {
     }
 
     impl RpcStruct for Test {
-        fn register_fns(&'static self, dispatcher: &super::Dispatcher) {
+        fn register_fns(&'static self, dispatcher: &mut super::Dispatcher) {
             dispatcher.register_fn(
                 "test2".to_owned(),
                 Arc::new(move |req: String| Box::pin(async move { self.rpc_fn(req).await })),
@@ -112,14 +113,14 @@ mod tests {
 
         let dt = Test::singleton(Test {});
 
-        dis.register_fn("test".to_owned(), Arc::new(rpc_test_fn));
-        dis.register_struct(dt);
+        dis.write().await.register_fn("test".to_owned(), Arc::new(rpc_test_fn));
+        dis.write().await.register_struct(dt);
 
-        let res = dis.dispatch("test 123 32.3 hey".as_bytes()).await;
+        let res = dis.read().await.dispatch("test 123 32.3 hey".as_bytes()).await;
         assert!(res.is_ok());
         assert!(String::from_utf8(res.unwrap()).unwrap() == "12".to_owned());
 
-        let res = dis.dispatch("test2 123 32.3 hey".as_bytes()).await;
+        let res = dis.read().await.dispatch("test2 123 32.3 hey".as_bytes()).await;
         assert!(res.is_ok());
         assert!(String::from_utf8(res.unwrap()).unwrap() == "12".to_owned());
     }

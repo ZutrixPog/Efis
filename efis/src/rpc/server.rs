@@ -1,4 +1,3 @@
-use nom::AsBytes;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8,25 +7,26 @@ use tokio::time::{self, Duration};
 use tracing::{error, info, instrument, warn};
 
 use crate::errors::RpcError;
-use crate::rpc::dispatcher::Dispatcher;
+use crate::rpc::dispatcher::{Dispatcher, RpcFunc};
+use crate::rpc::RpcStruct;
 
 const MAX_CONNECTIONS: usize = 1000;
 
 pub struct RpcServer {
-    dispatcher: Arc<Dispatcher>,
+    dispatcher: Arc<RwLock<Dispatcher>>,
 }
 
 struct Listener {
     listener: TcpListener,
     limit_connections: Arc<Semaphore>,
     notify_shutdown: broadcast::Sender<()>,
-    dispatcher: Arc<Dispatcher>,
+    dispatcher: Arc<RwLock<Dispatcher>>,
     shutdown_complete_tx: mpsc::Sender<()>,
 }
 
 struct Handler {
     socket: TcpStream,
-    dispatcher: Arc<Dispatcher>,
+    dispatcher: Arc<RwLock<Dispatcher>>,
     shutdown: Shutdown,
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -34,11 +34,11 @@ struct Handler {
 impl RpcServer {
     pub fn new() -> Self {
         Self {
-            dispatcher: Arc::new(Dispatcher::new()),
+            dispatcher: Dispatcher::new(),
         }
     }
 
-    pub async fn run(&self, host: &str, shutdown: impl Future) -> anyhow::Result<()> {
+    pub async fn run(&self, host: &str) -> anyhow::Result<()> {
         let listener = TcpListener::bind(host).await?;
         let (notify_shutdown, _) = broadcast::channel(1);
         let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
@@ -57,9 +57,9 @@ impl RpcServer {
                     error!(cause = %err, "failed to accept");
                 }
             }
-            _ = shutdown => {
-                info!("shutting down");
-            }
+            // _ = shutdown => {
+            //     info!("shutting down");
+            // }
         }
 
         let Listener {
@@ -73,6 +73,14 @@ impl RpcServer {
 
         let _ = shutdown_complete_rx.recv().await;
         Ok(())
+    }
+
+    pub async fn register_fn(&self, method: String, rpc_fn: Arc<RpcFunc>) {
+        self.dispatcher.write().await.register_fn(method, rpc_fn) 
+    }
+
+    pub async fn register_struct(&self, st: &'static dyn RpcStruct) {
+        self.dispatcher.write().await.register_struct(st);
     }
 }
 
@@ -129,7 +137,7 @@ impl Handler {
     #[instrument(skip(self))]
     async fn run(&mut self) -> Result<(), RpcError> {
         while !self.shutdown.is_shutdown() {
-            let mut buf = vec![0; 1024];
+            let mut buf = Vec::with_capacity(1024);
             let n = tokio::select! {
                 n = self.socket.read(&mut buf) => n.unwrap_or(0),
                 _ = self.shutdown.recv() => {
@@ -141,12 +149,11 @@ impl Handler {
                 return Err(RpcError::EmptyRequest);
             }
 
-            //let (tx, mut rx) = mpsc::channel(1024);
-
-            let res = self.dispatcher.as_ref().dispatch(&buf).await;
+            let res = self.dispatcher.read().await.dispatch(&buf).await;
             if let Ok(r) = res {
                 let _ = self.socket.write(&r).await;
             } else {
+                println!("err");
                 let _ = self
                     .socket
                     .write(res.unwrap_err().to_string().as_bytes())

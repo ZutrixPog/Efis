@@ -25,7 +25,7 @@ pub fn serialize_deserialize_derive(input: TokenStream) -> TokenStream {
                 let deserialize_fields = field_names.iter().enumerate().map(|(i, name)| {
 
                     quote! {
-                        let #name = parts[#i].parse().map_err(|_| format!("Failed to parse field '{}'", stringify!(#name)))?;
+                        let #name = parts[#i].parse().map_err(|err| format!("Failed to parse field '{}': {}", stringify!(#name), err))?;
 
                     }
                 });
@@ -106,7 +106,7 @@ pub fn rpc_func(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let output = if let Some(self_arg) = self_arg {
         quote! {
-            fn #fn_name(#self_arg, req: String) -> Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<String>> + Send>> {
+            fn #fn_name(#self_arg, req: String) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<String>> + Send>> {
                 let req = #req_type::deserialize(req.as_str()).unwrap();
                 Box::pin(async move {
                     let result: #output_type = #fn_body;
@@ -116,7 +116,7 @@ pub fn rpc_func(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {
-            fn #fn_name(req: String) -> Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<String>> + Send>> {
+            fn #fn_name(req: String) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<String>> + Send>> {
                 let req = #req_type::deserialize(req.as_str()).unwrap();
                 Box::pin(async move {
                     let result: #output_type = #fn_body;

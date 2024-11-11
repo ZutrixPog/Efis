@@ -18,7 +18,7 @@ pub trait Deserialize: Sized {
 }
 
 pub trait RpcStruct {
-    fn register_fns(&'static self, dispatcher: &dispatcher::Dispatcher);
+    fn register_fns(&'static self, dispatcher: &mut dispatcher::Dispatcher);
 }
 
 #[cfg(test)]
