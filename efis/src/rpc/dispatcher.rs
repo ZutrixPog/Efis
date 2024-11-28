@@ -36,12 +36,11 @@ impl Dispatcher {
         let mut parts = req_str.split(" ").collect::<Vec<&str>>();
         let method = parts.remove(0);
 
-        println!("method {}", method);
-        let rpc_fn = self.methods
+        let rpc_fn = self
+            .methods
             .get(method)
             .ok_or_else(|| anyhow::anyhow!("Method not found"))?;
 
-        println!("before {}", parts.clone().join(" "));
         let response = rpc_fn(parts.join(" ")).await?;
 
         Ok(response.into_bytes())
@@ -103,7 +102,6 @@ mod tests {
 
     #[rpc_func]
     async fn rpc_test_fn(req: Req) -> anyhow::Result<Res> {
-        println!("shit");
         Ok(Res { a: 12 })
     }
 
@@ -113,14 +111,24 @@ mod tests {
 
         let dt = Test::singleton(Test {});
 
-        dis.write().await.register_fn("test".to_owned(), Arc::new(rpc_test_fn));
+        dis.write()
+            .await
+            .register_fn("test".to_owned(), Arc::new(rpc_test_fn));
         dis.write().await.register_struct(dt);
 
-        let res = dis.read().await.dispatch("test 123 32.3 hey".as_bytes()).await;
+        let res = dis
+            .read()
+            .await
+            .dispatch("test 123 32.3 hey".as_bytes())
+            .await;
         assert!(res.is_ok());
         assert!(String::from_utf8(res.unwrap()).unwrap() == "12".to_owned());
 
-        let res = dis.read().await.dispatch("test2 123 32.3 hey".as_bytes()).await;
+        let res = dis
+            .read()
+            .await
+            .dispatch("test2 123 32.3 hey".as_bytes())
+            .await;
         assert!(res.is_ok());
         assert!(String::from_utf8(res.unwrap()).unwrap() == "12".to_owned());
     }

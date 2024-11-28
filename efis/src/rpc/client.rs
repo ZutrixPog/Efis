@@ -1,19 +1,18 @@
 use std::time::Duration;
 
-use tokio::io::{
-    AsyncWriteExt,
-    AsyncReadExt,
-};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 
 use super::Serialize;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 50;
+const BUFF_SIZE: usize = 512;
 
 // TODO: add auth
 pub struct Client {
-    conn: Mutex<TcpStream>, }
+    conn: Mutex<TcpStream>,
+}
 
 impl Client {
     pub async fn connect(addr: String) -> Self {
@@ -24,15 +23,20 @@ impl Client {
         }
     }
 
-    pub async fn call(&self, method: String, req: &dyn Serialize) -> anyhow::Result<String>  {
-        let req = format!("{} {}", method, req.serialize()).into_bytes();
+    pub async fn call(&self, method: String, req: &dyn Serialize) -> anyhow::Result<String> {
+        let req = format!("{} {}\n", method, req.serialize()).into_bytes();
 
-        let mut conn = self.conn.lock().await; 
+        let mut conn = self.conn.lock().await;
         conn.write_all(&req).await?;
+        conn.flush().await?;
 
-        let mut buff = Vec::with_capacity(1024);
-        let _ = tokio::time::timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), conn.read(&mut buff)).await?;
-        println!("read res {:?}", buff.clone());
+        let mut buff = vec![0u8; BUFF_SIZE];
+        let n = tokio::time::timeout(
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            conn.read(&mut buff),
+        )
+        .await??;
+        buff = buff[..n].to_vec();
 
         Ok(String::from_utf8(buff)?)
     }
@@ -42,9 +46,9 @@ impl Client {
 mod tests {
     use crate::rpc::client::Client;
     use crate::rpc::server::RpcServer;
-    use crate::rpc::{Serialize, Deserialize, SerDe};
-    use std::sync::Arc;
+    use crate::rpc::{Deserialize, SerDe, Serialize};
     use macros::{rpc_func, SerDe};
+    use std::sync::Arc;
 
     #[derive(SerDe, Debug, PartialEq, Default, Clone)]
     struct Req {
@@ -59,14 +63,14 @@ mod tests {
     #[tokio::test]
     async fn test_simple_req() {
         tokio::spawn(async {
-            run_server().await; 
+            run_server().await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
         let client = Client::connect("localhost:8080".to_owned()).await;
         let input = 12;
-        let res = client.call("test".to_owned(), &Req{ a: input }).await;
+        let res = client.call("test".to_owned(), &Req { a: input }).await;
         assert!(res.is_ok());
         let res = res.unwrap();
         println!("res: {}", res);
@@ -78,7 +82,9 @@ mod tests {
     async fn run_server() {
         let server = RpcServer::new();
 
-        server.register_fn("test".to_owned(), Arc::new(rpc_test_fn)).await;
+        server
+            .register_fn("test".to_owned(), Arc::new(rpc_test_fn))
+            .await;
 
         let _ = server.run("localhost:8080").await;
     }

@@ -1,8 +1,7 @@
-mod dispatcher;
-
 use std::sync::Arc;
 
 pub mod client;
+mod dispatcher;
 pub mod server;
 
 pub trait SerDe: Serialize + Deserialize + Clone + Send + Sync {

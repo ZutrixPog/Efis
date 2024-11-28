@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,6 +10,7 @@ use crate::rpc::dispatcher::{Dispatcher, RpcFunc};
 use crate::rpc::RpcStruct;
 
 const MAX_CONNECTIONS: usize = 1000;
+pub const BUFF_SIZE: usize = 512;
 
 pub struct RpcServer {
     dispatcher: Arc<RwLock<Dispatcher>>,
@@ -76,7 +76,7 @@ impl RpcServer {
     }
 
     pub async fn register_fn(&self, method: String, rpc_fn: Arc<RpcFunc>) {
-        self.dispatcher.write().await.register_fn(method, rpc_fn) 
+        self.dispatcher.write().await.register_fn(method, rpc_fn)
     }
 
     pub async fn register_struct(&self, st: &'static dyn RpcStruct) {
@@ -137,13 +137,14 @@ impl Handler {
     #[instrument(skip(self))]
     async fn run(&mut self) -> Result<(), RpcError> {
         while !self.shutdown.is_shutdown() {
-            let mut buf = Vec::with_capacity(1024);
+            let mut buf = vec![0u8; BUFF_SIZE];
             let n = tokio::select! {
                 n = self.socket.read(&mut buf) => n.unwrap_or(0),
                 _ = self.shutdown.recv() => {
                     return Ok(());
                 }
             };
+            buf = buf[..n].to_vec();
 
             if n == 0 {
                 return Err(RpcError::EmptyRequest);
@@ -153,7 +154,6 @@ impl Handler {
             if let Ok(r) = res {
                 let _ = self.socket.write(&r).await;
             } else {
-                println!("err");
                 let _ = self
                     .socket
                     .write(res.unwrap_err().to_string().as_bytes())
