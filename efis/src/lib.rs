@@ -1,11 +1,9 @@
 mod client;
-mod consensus;
+pub mod consensus;
 pub mod efis;
 pub mod errors;
-pub mod parser;
 pub mod pubsub;
-mod rpc;
+pub mod rpc;
 mod serializer;
-pub mod server;
-mod storage;
+pub mod storage;
 pub mod store;

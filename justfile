@@ -1,6 +1,6 @@
 port := '8080'
 backup_interval := '20'
-backup_path := './backup'
+backup_path := '/tmp/backup'
 
 build:
     cargo build --release

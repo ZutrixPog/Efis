@@ -2,7 +2,7 @@ use core::time;
 use rand::Rng;
 use std::fmt::Debug;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{self, AtomicI32, AtomicUsize};
+use std::sync::atomic::{AtomicI32, AtomicUsize};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, time::SystemTime};

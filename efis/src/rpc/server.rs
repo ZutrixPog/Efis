@@ -6,8 +6,8 @@ use tokio::time::{self, Duration};
 use tracing::{error, info, instrument, warn};
 
 use crate::errors::RpcError;
-use crate::rpc::dispatcher::{Dispatcher, RpcFunc};
-use crate::rpc::RpcStruct;
+use crate::rpc::dispatcher::{Dispatcher, RpcFunc, RpcStreamFunc};
+use crate::rpc::{ErrorRes, RpcStruct, Serialize};
 
 const MAX_CONNECTIONS: usize = 1000;
 pub const BUFF_SIZE: usize = 512;
@@ -77,6 +77,13 @@ impl RpcServer {
 
     pub async fn register_fn(&self, method: String, rpc_fn: Arc<RpcFunc>) {
         self.dispatcher.write().await.register_fn(method, rpc_fn)
+    }
+
+    pub async fn register_stream_fn(&self, method: String, stream_fn: Arc<RpcStreamFunc>) {
+        self.dispatcher
+            .write()
+            .await
+            .register_stream_fn(method, stream_fn)
     }
 
     pub async fn register_struct(&self, st: &'static dyn RpcStruct) {
@@ -150,14 +157,39 @@ impl Handler {
                 return Err(RpcError::EmptyRequest);
             }
 
-            let res = self.dispatcher.read().await.dispatch(&buf).await;
+            let res = self.dispatcher.read().await.dispatch_rpc(&buf).await;
             if let Ok(r) = res {
                 let _ = self.socket.write(&r).await;
+                continue;
             } else {
-                let _ = self
-                    .socket
-                    .write(res.unwrap_err().to_string().as_bytes())
-                    .await;
+                let err = res.unwrap_err();
+                if !err.to_string().contains("found") {
+                    let err_msg = ErrorRes {
+                        error: err.to_string(),
+                    }
+                    .serialize()+ "\n";
+                    let _ = self.socket.write(err_msg.as_bytes()).await;
+                    continue;
+                }
+            }
+
+            let res = self.dispatcher.read().await.dispatch_stream(&buf).await;
+            if let Err(err) = res {
+                let err_msg = ErrorRes {
+                    error: err.to_string(),
+                }
+                .serialize() + "\n";
+                let _ = self.socket.write(err_msg.as_bytes()).await;
+                continue;
+            }
+            let mut res_ch = res.unwrap();
+            while let Some(msg) = res_ch.recv().await {
+                if msg.contains("exit") {
+                    res_ch.close();
+                    break;
+                }
+
+                let _ = self.socket.write(msg.as_bytes()).await;
             }
         }
 

@@ -1,18 +1,17 @@
-use tokio::time::{Duration, interval};
-use tokio::sync::broadcast;
-use std::sync::{Arc, Mutex};
-use std::convert::From;
-use std::collections::{VecDeque, HashSet, BTreeMap, HashMap};
-use std::cmp::PartialEq;
-use std::path::Path;
-use std::time::SystemTime;
-use tracing::{info, error};
 use serde::{Deserialize, Serialize};
+use std::cmp::PartialEq;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::convert::From;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+use tokio::sync::broadcast;
+use tokio::time::{interval, Duration};
+use tracing::{error, info};
 
 use crate::errors::*;
+use crate::serializer::{decode, encode};
 use crate::storage::backup::FileBackupRepo;
-use crate::serializer::{encode, decode};
-
 
 const PATH: &str = "./backup";
 pub type Key = String;
@@ -41,8 +40,9 @@ pub struct DatastoreGuard {
 
 impl DatastoreGuard {
     pub async fn new(interval: Option<Duration>, path: Option<String>) -> Self {
-        let repo = FileBackupRepo::new(Path::new(&path.clone().unwrap_or(PATH.to_string())).to_path_buf());
-        
+        let repo =
+            FileBackupRepo::new(Path::new(&path.clone().unwrap_or(PATH.to_string())).to_path_buf());
+
         let mut guard = if let Ok(data) = repo.retrieve().await {
             info!("reading data from backup.");
             let mut g = DatastoreGuard::from(data);
@@ -50,15 +50,20 @@ impl DatastoreGuard {
             g.path = path;
             g
         } else {
-            Self { store: Datastore::new(), interval, path, notify_shutdown: None }
+            Self {
+                store: Datastore::new(),
+                interval,
+                path,
+                notify_shutdown: None,
+            }
         };
-        
+
         if guard.interval.is_some() && guard.path.is_some() {
             guard.run_backup();
         }
         guard
     }
-    
+
     pub fn store(&self) -> Datastore {
         self.store.clone()
     }
@@ -77,7 +82,7 @@ impl DatastoreGuard {
         tokio::spawn(async move {
             let repo = FileBackupRepo::new(Path::new(&path).to_path_buf());
             let mut inter = interval(dur);
-        
+
             loop {
                 tokio::select! {
                     _ = receiver.recv() => {
@@ -120,31 +125,35 @@ pub struct Datastore {
 impl Datastore {
     pub fn new() -> Self {
         Self {
-            data: Arc::new(Mutex::new(HashMap::new()))
+            data: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn encode(&self) -> Result<Vec<u8>, DatastoreError> {
         let data = self.data.lock().unwrap();
-        encode(data.clone())
-            .map_err(|_| DatastoreError::Other("couldn't encode".to_string()))
+        encode(data.clone()).map_err(|_| DatastoreError::Other("couldn't encode".to_string()))
     }
-    
+
     pub fn shutdown_purge_task(&self) {
         let state = self.data.lock().unwrap();
-        
+
         drop(state);
     }
 }
 
 impl Datastore {
-    pub fn set(&mut self, key: String, value: Value, expiry: Option<Duration>) -> Result<(), DatastoreError> {
+    pub fn set(
+        &mut self,
+        key: String,
+        value: Value,
+        expiry: Option<Duration>,
+    ) -> Result<(), DatastoreError> {
         let item = Item {
             value: value,
             expiry: expiry.map(|d| SystemTime::now() + d),
         };
         let mut data = self.data.lock().unwrap();
-        data.entry(key).or_insert(item);
+        data.insert(key,item);
         Ok(())
     }
 
@@ -157,7 +166,7 @@ impl Datastore {
                     return None;
                 }
             }
-            
+
             Some(item.value.clone())
         } else {
             None
@@ -218,7 +227,6 @@ impl Datastore {
             Err(DatastoreError::KeyNotFound)
         }
     }
-
 }
 
 impl From<Vec<u8>> for DatastoreGuard {
@@ -226,9 +234,9 @@ impl From<Vec<u8>> for DatastoreGuard {
         let decoded = decode(&value).unwrap();
 
         DatastoreGuard {
-            store: Datastore{
-                data: Arc::new(Mutex::new(decoded))
-            }, 
+            store: Datastore {
+                data: Arc::new(Mutex::new(decoded)),
+            },
             interval: None,
             path: None,
             notify_shutdown: None,
@@ -245,7 +253,6 @@ mod tests {
     async fn test_set_and_get() {
         let guard = DatastoreGuard::new(None, None).await;
         let mut datastore = guard.store();
-        
 
         let mut list = VecDeque::new();
         list.push_back("hello".to_owned());
@@ -258,10 +265,14 @@ mod tests {
 
         let vals = vec![
             ("key1".to_owned(), Value::Text("value1".to_owned()), None),
-            ("key2".to_owned(), Value::Text("value2".to_owned()), Some(Duration::from_secs(2))),
+            (
+                "key2".to_owned(),
+                Value::Text("value2".to_owned()),
+                Some(Duration::from_secs(2)),
+            ),
             ("key3".to_owned(), Value::List(list.clone()), None),
             ("key4".to_owned(), Value::Set(set.clone()), None),
-            ("Key5".to_owned(), Value::SortedSet(sorted.clone()), None)
+            ("Key5".to_owned(), Value::SortedSet(sorted.clone()), None),
         ];
 
         for (key, value, duration) in vals {
@@ -273,7 +284,7 @@ mod tests {
             ("key2", None),
             ("key3", Some(Value::List(list))),
             ("key4", Some(Value::Set(set))),
-            ("Key5", Some(Value::SortedSet(sorted)))
+            ("Key5", Some(Value::SortedSet(sorted))),
         ];
 
         std::thread::sleep(Duration::from_secs(4));
@@ -302,8 +313,12 @@ mod tests {
         let guard = DatastoreGuard::new(None, None).await;
         let mut datastore = guard.store();
 
-        let _ = datastore.set("key1".to_owned(), Value::Text("value1".to_owned()), Some(Duration::from_secs(2)));
-        let _ = datastore.set("key2".to_owned(), Value::Text("value2".to_owned()),None);
+        let _ = datastore.set(
+            "key1".to_owned(),
+            Value::Text("value1".to_owned()),
+            Some(Duration::from_secs(2)),
+        );
+        let _ = datastore.set("key2".to_owned(), Value::Text("value2".to_owned()), None);
 
         assert!(datastore.ttl("key1").is_ok());
         assert_eq!(datastore.ttl("key2"), Ok(None));
@@ -313,12 +328,12 @@ mod tests {
         assert!(datastore.ttl("key1").is_err());
         assert!(datastore.get("key1").is_none());
     }
-    
+
     #[tokio::test]
     async fn test_modify_existing_key() {
         let guard = DatastoreGuard::new(None, None).await;
         let mut datastore = guard.store();
-        
+
         let _ = datastore.set("key".to_owned(), Value::Text("value".to_owned()), None);
 
         let res = datastore.modify("key", |value| {
@@ -328,7 +343,10 @@ mod tests {
         });
 
         assert!(res.is_ok());
-        assert_eq!(datastore.get("key"), Some(Value::Text("new_value".to_owned())));
+        assert_eq!(
+            datastore.get("key"),
+            Some(Value::Text("new_value".to_owned()))
+        );
     }
 
     #[tokio::test]
@@ -343,8 +361,20 @@ mod tests {
         let _ = datastore.set(key1.to_owned(), value1.clone(), None);
 
         let mut test_data = HashMap::new();
-        test_data.insert(key.to_owned(), Item{value:value, expiry: None});
-        test_data.insert(key1.to_owned(), Item{value: value1, expiry: None});
+        test_data.insert(
+            key.to_owned(),
+            Item {
+                value: value,
+                expiry: None,
+            },
+        );
+        test_data.insert(
+            key1.to_owned(),
+            Item {
+                value: value1,
+                expiry: None,
+            },
+        );
 
         let encoded = datastore.encode();
         assert!(encoded.is_ok());

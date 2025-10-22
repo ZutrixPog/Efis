@@ -1,69 +1,129 @@
 extern crate proc_macro;
-use proc_macro::TokenStream;
+use std::fmt::format;
 
+use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields, FnArg, ItemFn, ReturnType};
+use syn::{
+    parse_macro_input, parse_quote, Attribute, FnArg, ImplItem, ItemFn, ItemImpl, ItemStruct,
+    ReturnType,
+};
 
 #[proc_macro_derive(SerDe)]
 pub fn serialize_deserialize_derive(input: TokenStream) -> TokenStream {
+    use quote::quote;
+    use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
+
     let input = parse_macro_input!(input as DeriveInput);
-
     let name = &input.ident;
-    let data = &input.data;
 
-    let expanded = match data {
-        Data::Struct(ref data_struct) => match &data_struct.fields {
-            Fields::Named(ref fields) => {
-                let field_names: Vec<_> = fields.named.iter().map(|f| &f.ident).collect();
+    let fields = match &input.data {
+        Data::Struct(s) => match &s.fields {
+            Fields::Named(f) => &f.named,
+            _ => panic!("SerDe can only be derived for structs with named fields"),
+        },
+        _ => panic!("SerDe can only be derived for structs"),
+    };
 
-                let serialize_fields = field_names.iter().map(|name| {
-                    quote! {
-                        result.push(self.#name.to_string());
-                    }
-                });
+    let field_names: Vec<_> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+    let field_strs: Vec<_> = field_names.iter().map(|f| f.to_string()).collect();
+    let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
 
-                let deserialize_fields = field_names.iter().enumerate().map(|(i, name)| {
+    fn is_optional(ty: &Type) -> bool {
+        if let Type::Path(tp) = ty {
+            if let Some(seg) = tp.path.segments.first() {
+                return seg.ident == "Option";
+            }
+        }
+        false
+    }
 
-                    quote! {
-                        let #name = parts[#i].parse().map_err(|err| format!("Failed to parse field '{}': {}", stringify!(#name), err))?;
+    let mut ser_generics = input.generics.clone();
+    for param in &mut ser_generics.params {
+        if let syn::GenericParam::Type(type_param) = param {
+            type_param.bounds.push(parse_quote!(Serialize));
+        }
+    }
 
-                    }
-                });
+    let mut de_generics = input.generics.clone();
+    for param in &mut de_generics.params {
+        if let syn::GenericParam::Type(type_param) = param {
+            type_param.bounds.push(parse_quote!(Deserialize));
+        }
+    }
 
+    let (ser_impl, ser_ty, ser_where) = ser_generics.split_for_impl();
+    let (de_impl, de_ty, de_where) = de_generics.split_for_impl();
+
+    let serialize_fields = field_names
+        .iter()
+        .zip(field_strs.iter())
+        .map(|(name, key)| {
+            quote! {
+                if let Some(val) = {
+                    let serialized = self.#name.serialize();
+                    if serialized != "None" {
+                        Some(format!("{}={}", #key, serialized))
+                    } else { None }
+                } {
+                    parts.push(val);
+                }
+            }
+        });
+
+    let deserialize_fields = field_names
+        .iter()
+        .zip(field_strs.iter())
+        .zip(field_types.iter())
+        .map(|((name, key), ty)| {
+            let is_opt = is_optional(ty);
+            if is_opt {
                 quote! {
-                    impl Serialize for #name {
-                        fn serialize(&self) -> String {
-                            let mut result = Vec::new();
-                            #(#serialize_fields)*
-                            result.join(" ")
-                        }
-                    }
-
-                    impl Deserialize for #name {
-                        fn deserialize(s: &str) -> Result<Self, String> {
-                            let parts: Vec<&str> = s.split_whitespace().collect();
-
-                            #(#deserialize_fields)*
-
-                            Ok(#name {
-                                #(#field_names),*
-                            })
-                        }
-                    }
-
-                    impl SerDe for #name {
-                        fn as_any(&self) -> Arc<dyn std::any::Any> {
-                            Arc::new(self.clone())
+                    #name: {
+                        if let Some(val) = map.get(#key) {
+                            <#ty>::deserialize(val)?
+                        } else {
+                            None
                         }
                     }
                 }
+            } else {
+                quote! {
+                    #name: {
+                        let val = map.get(#key)
+                            .ok_or_else(|| format!("Missing field '{}'", #key))?;
+                        <#ty>::deserialize(val)?
+                    }
+                }
             }
-            _ => panic!("SerializeDeserialize can only be derived for structs with named fields"),
-        },
-        _ => panic!("SerializeDeserialize can only be derived for structs"),
+        });
+
+    // let name_with_generics = format!("{}{}", name, generics);
+    let output = quote! {
+        impl #ser_impl Serialize for #name #ser_ty #ser_where {
+            fn serialize(&self) -> String {
+                let mut parts = Vec::new();
+                #(#serialize_fields)*
+                format!("{{{}}}", parts.join(" "))
+            }
+        }
+
+        impl #de_impl Deserialize for #name #de_ty #de_where {
+            fn deserialize(s: &str) -> Result<Self, String> {
+                let s = s.trim();
+                let inner = if s.starts_with('{') && s.ends_with('}') {
+                    &s[1..s.len()-1]
+                } else {
+                    s
+                };
+                let map = crate::rpc::parse_key_values(inner)?;
+                Ok(Self {
+                    #(#deserialize_fields),*
+                })
+            }
+        }
     };
 
-    TokenStream::from(expanded)
+    TokenStream::from(output)
 }
 
 #[proc_macro_attribute]
@@ -107,9 +167,12 @@ pub fn rpc_func(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let output = if let Some(self_arg) = self_arg {
         quote! {
             fn #fn_name(#self_arg, req: String) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<String>> + Send>> {
-                let req = #req_type::deserialize(req.as_str()).unwrap();
                 Box::pin(async move {
+                    let req = #req_type::deserialize(req.as_str())
+                        .map_err(|e| ::anyhow::anyhow!("Failed to deserialize request: {}", e))?;
+
                     let result: #output_type = #fn_body;
+
                     result.map(|res| res.serialize())
                 })
             }
@@ -117,14 +180,179 @@ pub fn rpc_func(_attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {
             fn #fn_name(req: String) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<String>> + Send>> {
+                Box::pin(async move {
+                    let req = #req_type::deserialize(req.as_str())
+                        .map_err(|e| ::anyhow::anyhow!("Failed to deserialize request: {}", e))?;
+
+                    let result: #output_type = #fn_body;
+
+                    result.map(|res| res.serialize())
+                })
+
+            }
+        }
+    };
+
+    TokenStream::from(output)
+}
+
+#[proc_macro_attribute]
+pub fn rpc_stream(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    use quote::quote;
+    use syn::{parse_macro_input, FnArg, ItemFn, ReturnType};
+
+    let input = parse_macro_input!(item as ItemFn);
+    let fn_name = &input.sig.ident;
+    let fn_body = &input.block;
+
+    let is_method = matches!(input.sig.inputs.first(), Some(FnArg::Receiver(_)));
+
+    let (self_arg, req_arg) = if is_method {
+        let self_arg = input.sig.inputs.first().unwrap();
+        let req_arg = input
+            .sig
+            .inputs
+            .iter()
+            .nth(1)
+            .expect("Expected method to have a second argument");
+        (Some(self_arg), req_arg)
+    } else {
+        (
+            None,
+            input
+                .sig
+                .inputs
+                .first()
+                .expect("Expected function to have one argument"),
+        )
+    };
+
+    let req_type = match req_arg {
+        FnArg::Typed(arg) => &arg.ty,
+        _ => panic!("Expected typed argument for req"),
+    };
+
+    let output_type = match &input.sig.output {
+        ReturnType::Type(_, ty) => ty,
+        _ => panic!("Expected a return type of `anyhow::Result<mpsc::Receiver<Res>>`"),
+    };
+
+    let output = if let Some(self_arg) = self_arg {
+        quote! {
+            fn #fn_name(#self_arg, req: String)
+                -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<::tokio::sync::mpsc::Receiver<String>>> + Send>>
+            {
                 let req = #req_type::deserialize(req.as_str()).unwrap();
                 Box::pin(async move {
                     let result: #output_type = #fn_body;
-                    result.map(|res| res.serialize())
+                    result.map(|rx| {
+                        let (tx2, rx2) = ::tokio::sync::mpsc::channel(10);
+                        ::tokio::spawn(async move {
+                            let mut rx = rx;
+                            while let Some(item) = rx.recv().await {
+                                let _ = tx2.send(item.serialize() + "\n").await;
+                            }
+                            let _ = tx2.send("done\n".to_string()).await;
+                            drop(tx2);
+                        });
+                        rx2
+                    })
+                })
+            }
+        }
+    } else {
+        quote! {
+            fn #fn_name(req: String)
+                -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<::tokio::sync::mpsc::Receiver<String>>> + Send>>
+            {
+                let req = #req_type::deserialize(req.as_str()).unwrap();
+                Box::pin(async move {
+                    let result: #output_type = #fn_body;
+                    result.map(|rx| {
+                        let (tx2, rx2) = ::tokio::sync::mpsc::channel(10);
+                        ::tokio::spawn(async move {
+                            let mut rx = rx;
+                            while let Some(item) = rx.recv().await {
+                                let _ = tx2.send(item.serialize() + "\n").await;
+                            }
+                            let _ = tx2.send("done\n".to_string()).await;
+                            drop(tx2);
+                        });
+                        rx2
+                    })
                 })
             }
         }
     };
 
     TokenStream::from(output)
+}
+
+#[proc_macro_attribute]
+pub fn rpc_struct(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemStruct);
+    let struct_name = &input.ident;
+
+    let expanded = quote! {
+        #input
+    };
+
+    expanded.into()
+}
+
+#[proc_macro_attribute]
+pub fn rpc_impl(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemImpl);
+
+    let ty = &input.self_ty;
+    let ty_str = quote!(#ty).to_string();
+
+    let mut rpc_methods = Vec::new();
+
+    for item in &input.items {
+        if let ImplItem::Fn(method) = item {
+            let method_name = &method.sig.ident;
+            let method_name_str = method_name.to_string();
+
+            if has_rpc_func_attr(&method.attrs) {
+                rpc_methods.push(quote! {
+                    dispatcher.register_fn(
+                        format!("{}", #method_name_str),
+                        std::sync::Arc::new(move |req: String| {
+                            Box::pin(async move { self.#method_name(req).await })
+                        }),
+                    );
+                });
+            } else if has_rpc_stream_attr(&method.attrs) {
+                rpc_methods.push(quote! {
+                    dispatcher.register_stream_fn(
+                        format!("{}", #method_name_str),
+                        std::sync::Arc::new(move |req: String| {
+                            Box::pin(async move { self.#method_name(req).await })
+                        }),
+                    );
+                });
+            }
+        }
+    }
+
+    fn has_rpc_stream_attr(attrs: &[Attribute]) -> bool {
+        attrs.iter().any(|attr| attr.path().is_ident("rpc_stream"))
+    }
+
+    let expanded = quote! {
+        #input
+
+        impl RpcStruct for #ty {
+            fn register_fns(&'static self, dispatcher: &mut Dispatcher) {
+                #( #rpc_methods )*
+            }
+        }
+    };
+
+    expanded.into()
+}
+
+fn has_rpc_func_attr(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident("rpc_func"))
 }

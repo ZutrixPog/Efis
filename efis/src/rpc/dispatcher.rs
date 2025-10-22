@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+
+use crate::rpc::{Deserialize, ErrorRes, Serialize};
 
 use super::RpcStruct;
 
@@ -11,19 +13,30 @@ pub type RpcFunc = dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<
     + Sync
     + 'static;
 
+pub type RpcStreamFunc = dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<mpsc::Receiver<String>>> + Send>>
+    + Send
+    + Sync
+    + 'static;
+
 pub struct Dispatcher {
-    methods: HashMap<String, Arc<RpcFunc>>,
+    rpcs: HashMap<String, Arc<RpcFunc>>,
+    streams: HashMap<String, Arc<RpcStreamFunc>>,
 }
 
 impl Dispatcher {
     pub fn new() -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
-            methods: HashMap::new(),
+            rpcs: HashMap::new(),
+            streams: HashMap::new(),
         }))
     }
 
     pub fn register_fn(&mut self, method: String, rpc_fn: Arc<RpcFunc>) {
-        self.methods.insert(method, rpc_fn);
+        self.rpcs.insert(method, rpc_fn);
+    }
+
+    pub fn register_stream_fn(&mut self, method: String, stream_fn: Arc<RpcStreamFunc>) {
+        self.streams.insert(method, stream_fn);
     }
 
     // TODO: RpcStruct should be automatically implemented
@@ -31,36 +44,52 @@ impl Dispatcher {
         st.register_fns(self);
     }
 
-    pub async fn dispatch(&self, req: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub async fn dispatch_rpc(&self, req: &[u8]) -> anyhow::Result<Vec<u8>> {
         let req_str = String::from_utf8_lossy(req);
         let mut parts = req_str.split(" ").collect::<Vec<&str>>();
         let method = parts.remove(0);
 
         let rpc_fn = self
-            .methods
+            .rpcs
             .get(method)
             .ok_or_else(|| anyhow::anyhow!("Method not found"))?;
 
-        let response = rpc_fn(parts.join(" ")).await?;
+        let response = rpc_fn(parts.join(" ")).await? + "\n";
 
         Ok(response.into_bytes())
+    }
+
+    pub async fn dispatch_stream(&self, req: &[u8]) -> anyhow::Result<mpsc::Receiver<String>> {
+        let req_str = String::from_utf8_lossy(req);
+        let mut parts = req_str.split(" ").collect::<Vec<&str>>();
+        let method = parts.remove(0);
+
+        let stream_fn = self
+            .streams
+            .get(method)
+            .ok_or_else(|| anyhow::anyhow!("Method not found"))?;
+
+        let response = stream_fn(parts.join(" ")).await?;
+
+        Ok(response)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::SerDe;
     use crate::rpc::{Deserialize, Serialize};
-    use macros::{rpc_func, SerDe};
+    use macros::{rpc_func, rpc_impl, rpc_stream, rpc_struct, SerDe};
     use std::mem::MaybeUninit;
     use std::sync::Once;
+    use std::time::Duration;
 
     #[derive(SerDe, Debug, PartialEq, Default, Clone)]
     struct Req {
         a: i32,
         b: f64,
         c: String,
+        d: Vec<i32>,
     }
 
     #[derive(SerDe, Debug, PartialEq, Default, Clone)]
@@ -68,8 +97,10 @@ mod tests {
         a: i32,
     }
 
+    #[rpc_struct]
     struct Test {}
 
+    #[rpc_impl]
     impl Test {
         pub fn singleton(t: Self) -> &'static Self {
             static mut SINGLETON: MaybeUninit<Test> = MaybeUninit::uninit();
@@ -89,14 +120,18 @@ mod tests {
         pub async fn rpc_fn(&'static self, req: Req) -> anyhow::Result<Res> {
             Ok(Res { a: 12 })
         }
-    }
 
-    impl RpcStruct for Test {
-        fn register_fns(&'static self, dispatcher: &mut super::Dispatcher) {
-            dispatcher.register_fn(
-                "test2".to_owned(),
-                Arc::new(move |req: String| Box::pin(async move { self.rpc_fn(req).await })),
-            );
+        #[rpc_stream]
+        pub async fn rpc_stream_fn(&'static self, req: Req) -> anyhow::Result<mpsc::Receiver<Res>> {
+            let (tx, rx) = mpsc::channel(10);
+            tokio::spawn(async move {
+                for i in 0..req.a {
+                    let res = Res { a: i };
+                    let _ = tx.send(res).await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            });
+            Ok(rx)
         }
     }
 
@@ -119,17 +154,31 @@ mod tests {
         let res = dis
             .read()
             .await
-            .dispatch("test 123 32.3 hey".as_bytes())
+            .dispatch_rpc("test a=123 b=32.3 c=hey d=[1,2]".as_bytes())
             .await;
         assert!(res.is_ok());
-        assert!(String::from_utf8(res.unwrap()).unwrap() == "12".to_owned());
+
+        let res_str = String::from_utf8(res.unwrap()).unwrap();
+        assert!(res_str == "{a=12}\n".to_owned());
 
         let res = dis
             .read()
             .await
-            .dispatch("test2 123 32.3 hey".as_bytes())
+            .dispatch_rpc("rpc_fn {a=123 b=32.3 c=hey d=[1,2]}".as_bytes())
             .await;
         assert!(res.is_ok());
-        assert!(String::from_utf8(res.unwrap()).unwrap() == "12".to_owned());
+        assert!(String::from_utf8(res.unwrap()).unwrap() == "{a=12}\n".to_owned());
+
+        let mut res_chan = dis
+            .read()
+            .await
+            .dispatch_stream("rpc_stream_fn {a=4 b=32.3 c=hey d=[1,2]}".as_bytes())
+            .await;
+        assert!(res_chan.is_ok());
+        let mut vals = Vec::new();
+        while let Some(msg) = res_chan.as_mut().unwrap().recv().await {
+            vals.push(msg);
+        }
+        assert_eq!(4, vals.len());
     }
 }
