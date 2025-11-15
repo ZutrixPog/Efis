@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
+use tracing::error;
 
 use crate::rpc::{Deserialize, ErrorRes};
 
@@ -19,11 +20,16 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(addr: String) -> Self {
-        let conn = TcpStream::connect(addr.clone()).await.unwrap();
+        let mut conn = TcpStream::connect(addr.clone()).await;
+        while conn.is_err() {
+            error!("failed to connect to peer");
+            conn = TcpStream::connect(addr.clone()).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
 
         Client {
             addr: addr,
-            conn: Mutex::new(conn),
+            conn: Mutex::new(conn.unwrap()),
         }
     }
 

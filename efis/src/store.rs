@@ -100,7 +100,7 @@ impl DatastoreGuard {
 }
 
 async fn backup(data: &Datastore, repo: &FileBackupRepo) {
-    info!("backup data persisted on disk.");
+    // info!("backup data persisted on disk.");
     let data = data.encode().unwrap();
     if let Err(err) = repo.save(data).await {
         error!("backup service stopped: {}", err.to_string());
@@ -153,7 +153,7 @@ impl Datastore {
             expiry: expiry.map(|d| SystemTime::now() + d),
         };
         let mut data = self.data.lock().unwrap();
-        data.insert(key,item);
+        data.insert(key, item);
         Ok(())
     }
 

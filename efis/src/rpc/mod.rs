@@ -4,11 +4,11 @@ pub mod client;
 pub mod dispatcher;
 pub mod server;
 
-pub trait Serialize {
+pub trait Serialize: Sync + Send {
     fn serialize(&self) -> String;
 }
 
-pub trait Deserialize: Sized {
+pub trait Deserialize: Sized + Sync + Send {
     fn deserialize(s: &str) -> Result<Self, String>;
 }
 

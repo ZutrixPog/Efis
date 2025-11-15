@@ -153,9 +153,9 @@ impl Handler {
             };
             buf = buf[..n].to_vec();
 
-            if n == 0 {
-                return Err(RpcError::EmptyRequest);
-            }
+            // if n == 0 {
+            //     return Err(RpcError::EmptyRequest);
+            // }
 
             let res = self.dispatcher.read().await.dispatch_rpc(&buf).await;
             if let Ok(r) = res {

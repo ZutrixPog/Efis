@@ -1,42 +1,42 @@
 use core::time;
 use rand::Rng;
 use std::fmt::Debug;
-use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicI32, AtomicUsize};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, time::SystemTime};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{mpsc, Notify, OnceCell};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-use crate::client::Client;
-use crate::errors::ConsensusError;
+use crate::rpc::client::Client;
+use crate::rpc::dispatcher::Dispatcher;
+use crate::rpc::{Deserialize, RpcStruct, Serialize};
+use macros::{rpc_func, rpc_impl, rpc_struct, SerDe};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum State {
+pub enum State {
     Follower,
     Candidate,
     Leader,
     Dead,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, SerDe, Clone)]
 pub struct LogEntry {
     pub command: String,
     pub term: usize,
 }
 
+#[derive(Debug, Clone)]
 pub struct CommitEntry {
     pub command: String,
     pub term: usize,
     pub index: usize,
 }
 
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PersistentState {
     pub current_term: usize,
     pub voted_for: i32,
@@ -49,31 +49,32 @@ pub trait Storage {
     async fn restore(&self) -> anyhow::Result<PersistentState>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, SerDe)]
 pub struct RequestVote {
     pub term: usize,
     pub candidate_id: usize,
     pub last_log_index: usize,
-    pub last_long_term: usize,
+    pub last_log_term: usize,
 }
 
+#[derive(Debug, SerDe)]
 pub struct RequestVoteReply {
     pub term: usize,
     pub voted: bool,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, SerDe)]
 pub struct AppendEntries {
     pub term: usize,
     pub leader: usize,
 
-    pub prev_log_index: i32,
+    pub prev_log_index: usize,
     pub prev_log_term: usize,
     pub entries: Vec<LogEntry>,
     pub leader_commit: i32,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, SerDe)]
 pub struct AppendEntriesReply {
     pub term: usize,
     pub success: bool,
@@ -82,107 +83,199 @@ pub struct AppendEntriesReply {
     pub conflict_term: i32,
 }
 
-pub struct Consensus {
-    id: usize,
-    peers: Vec<usize>,
-    storage: Arc<dyn Storage + Send + Sync>,
-    commit_chan: mpsc::Receiver<CommitEntry>,
-    new_commit_ntfy: Notify,
-    shutdown_ntfy: Notify,
-    ae_trigger: Notify,
-
-    current_term: AtomicUsize,
-    voted_for: AtomicI32,
-    logs: RwLock<Vec<LogEntry>>,
-
-    commit_index: AtomicI32,
-    last_applied: Option<usize>,
-    state: RwLock<State>,
-    election_reset_event: RwLock<Option<SystemTime>>,
-
-    next_index: HashMap<i64, i64>,
-    match_index: HashMap<i64, i64>,
+#[derive(Debug)]
+enum ConsensusMsg {
+    StartElection(usize, Duration),
+    SendCommit,
+    Submit(String),
+    SendAES,
+    RequestVote(RequestVote, mpsc::Sender<anyhow::Result<RequestVoteReply>>),
+    AppendEntry(
+        AppendEntries,
+        mpsc::Sender<anyhow::Result<AppendEntriesReply>>,
+    ),
 }
 
+pub struct Consensus {
+    id: usize,
+    peers: Vec<(usize, Arc<Client>)>,
+    storage: Arc<dyn Storage + Send + Sync>,
+    rx: mpsc::Receiver<ConsensusMsg>,
+    tx: mpsc::Sender<ConsensusMsg>,
+    shutdown_ntfy: Notify,
+
+    current_term: usize,
+    voted_for: i32,
+    logs: Vec<LogEntry>,
+
+    commit_index: i32,
+    last_applied: Option<usize>,
+    state: State,
+    election_reset_event: Option<SystemTime>,
+
+    next_index: HashMap<usize, usize>,
+    match_index: HashMap<usize, usize>,
+}
+
+#[rpc_struct]
+pub struct ConsensusRPC {
+    tx: mpsc::Sender<ConsensusMsg>,
+}
+
+#[rpc_impl]
 impl Consensus {
-    pub async fn new(
-        id: usize,
-        peers: Vec<usize>,
-        storage: Arc<dyn Storage + Send + Sync>,
-        ready: Notify,
-        commit_chan: mpsc::Receiver<CommitEntry>,
-    ) -> Arc<Self> {
+    pub async fn new(id: usize, storage: Arc<dyn Storage + Send + Sync>) -> Self {
+        let (tx, rx) = mpsc::channel(1024);
+        let peers = Vec::new();
         let mut consensus = Consensus {
             id,
             peers,
             storage,
-            current_term: AtomicUsize::new(0),
-            voted_for: AtomicI32::new(-1),
-            logs: RwLock::new(Vec::new()),
-            commit_index: AtomicI32::new(-1),
+            rx,
+            tx: tx.clone(),
+            shutdown_ntfy: Notify::new(),
+
+            current_term: 0,
+            voted_for: -1,
+            logs: Vec::new(),
+            commit_index: -1,
             last_applied: None,
-            state: RwLock::new(State::Follower),
-            election_reset_event: RwLock::new(None),
+            state: State::Follower,
+            election_reset_event: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
-
-            commit_chan,
-            new_commit_ntfy: Notify::new(),
-            shutdown_ntfy: Notify::new(),
-            ae_trigger: Notify::new(),
         };
-
         consensus.restore_state().await;
-        let consensus = Arc::new(consensus);
-        let consensus_clone = Arc::clone(&consensus);
-
-        // TODO: clean up
-        tokio::spawn(async move {
-            ready.notified().await;
-            *consensus_clone.election_reset_event.write().await = Some(SystemTime::now());
-            consensus_clone.run_election_timer();
-        });
-
-        consensus.start_sending_commits();
         consensus
     }
 
-    pub async fn report(&self) -> (usize, usize, State) {
-        return (
-            self.id,
-            self.current_term.load(SeqCst),
-            *self.state.read().await,
-        );
+    pub async fn singleton(
+        id: usize,
+        storage: Arc<dyn Storage + Send + Sync>,
+    ) -> (&'static mut Self, &'static ConsensusRPC) {
+        static mut con: OnceCell<Consensus> = OnceCell::const_new();
+        static mut rpc: OnceCell<ConsensusRPC> = OnceCell::const_new();
+
+        unsafe {
+            let c = if let Some(c) = con.get_mut() {
+                c
+            } else {
+                let c = Self::new(id, storage).await;
+                con.set(c);
+                con.get_mut().unwrap()
+            };
+            let r = rpc
+                .get_or_init(async || ConsensusRPC { tx: c.tx.clone() })
+                .await;
+
+            (c, r)
+        }
     }
 
-    pub async fn submit(&self, cmd: String) -> bool {
-        let curr_state = *self.state.read().await;
+    pub async fn start(&mut self, peer_urls: Vec<String>, commit_chan: mpsc::Sender<CommitEntry>) {
+        let mut peers = Vec::new();
+        for (i, u) in peer_urls.into_iter().enumerate() {
+            peers.push((i, Arc::new(Client::connect(u).await)));
+        }
+        self.peers = peers;
+
+        self.election_reset_event = Some(SystemTime::now());
+        self.run_election_timer().await;
+
+        loop {
+            tokio::select! {
+                Some(msg) = self.rx.recv() => {
+                    match msg {
+                        ConsensusMsg::StartElection(starting_term, tm_duration) => {
+                            let curr_state = self.state;
+
+                            if curr_state != State::Candidate && curr_state != State::Follower {
+                                return;
+                            }
+
+                            if starting_term != self.current_term {
+                                return;
+                            }
+
+                            if let Some(election_event) = self.election_reset_event {
+                                if SystemTime::now()
+                                    .duration_since(election_event)
+                                    .unwrap_or(Duration::from_secs(0))
+                                    >= tm_duration
+                                {
+                                    self.start_election().await;
+                                    return;
+                                }
+                            }
+                        },
+                        ConsensusMsg::SendCommit => {
+                            self.send_commits(commit_chan.clone()).await;
+                        },
+                        ConsensusMsg::Submit(cmd) => {
+                            self._submit(cmd).await;
+                        },
+                        ConsensusMsg::SendAES => {
+                            if self.state != State::Leader {
+                                continue;
+                            }
+
+                            self.send_leader_aes().await;
+                        },
+                        ConsensusMsg::RequestVote(req, tx) => {
+                            let res = self._request_vote(req).await;
+                            let _ = tx.send(res).await;
+                        },
+                        ConsensusMsg::AppendEntry(req, tx) => {
+                            let res = self._append_entries(req).await;
+                            let _ = tx.send(res).await;
+                        }
+                        _ => {
+                            warn!("failed to process internal event of type: {:?}", msg);
+                        }
+                    }
+                }
+                _ = self.shutdown_ntfy.notified() => {
+                    return;
+                }
+            }
+        }
+    }
+
+    pub async fn report(&self) -> (usize, usize, State) {
+        return (self.id, self.current_term, self.state);
+    }
+
+    pub async fn submit(&mut self, cmd: String) -> bool {
+        let curr_state = self.state;
         info!("submiting a new command by {:?}", curr_state);
 
         if curr_state == State::Leader {
-            self.logs.write().await.push(LogEntry {
-                command: cmd,
-                term: self.current_term.load(SeqCst),
-            });
-            self.persist_state();
+            let _ = self.tx.send(ConsensusMsg::Submit(cmd)).await;
             info!("submited successfuly");
-
             return true;
         }
 
         false
     }
 
-    pub async fn stop(&self) {
-        *self.state.write().await = State::Dead;
-        self.shutdown_ntfy.notify_waiters();
+    async fn _submit(&mut self, cmd: String) {
+        self.logs.push(LogEntry {
+            command: cmd,
+            term: self.current_term,
+        });
+        self.persist_state().await;
+    }
+
+    pub fn stop(&mut self) {
+        self.state = State::Dead;
+        self.rx.close();
     }
 
     async fn restore_state(&mut self) {
         if let Ok(old_state) = self.storage.restore().await {
-            self.current_term.store(old_state.current_term, SeqCst);
-            self.logs = RwLock::new(old_state.logs);
-            self.voted_for.store(old_state.voted_for, SeqCst);
+            self.current_term = old_state.current_term;
+            self.logs = old_state.logs;
+            self.voted_for = old_state.voted_for;
         } else {
             error!("failed to restore state from storage");
         }
@@ -192,9 +285,9 @@ impl Consensus {
         let res = self
             .storage
             .store(PersistentState {
-                current_term: self.current_term.load(SeqCst),
-                voted_for: self.voted_for.load(SeqCst),
-                logs: self.logs.read().await.clone(),
+                current_term: self.current_term,
+                voted_for: self.voted_for,
+                logs: self.logs.clone(),
             })
             .await;
 
@@ -203,9 +296,9 @@ impl Consensus {
         }
     }
 
-    pub async fn request_vote(&self, req: RequestVote) -> Result<RequestVoteReply, ConsensusError> {
-        if *self.state.read().await == State::Dead {
-            return Err(ConsensusError::DeadNode);
+    async fn _request_vote(&mut self, req: RequestVote) -> anyhow::Result<RequestVoteReply> {
+        if self.state == State::Dead {
+            return Err(anyhow::format_err!("node is dead"));
         }
 
         let mut reply = RequestVoteReply {
@@ -213,9 +306,8 @@ impl Consensus {
             voted: false,
         };
         let last_log = self.last_log().await;
-        // TODO: DELOG
-        let voted_for = self.voted_for.load(SeqCst);
-        let current_term = self.current_term.load(SeqCst);
+        let voted_for = self.voted_for;
+        let current_term = self.current_term;
 
         if req.term > current_term {
             debug!("outdated term in RequestForVote");
@@ -224,63 +316,59 @@ impl Consensus {
 
         if current_term == req.term
             && (voted_for == -1 || voted_for == req.candidate_id as i32)
-            && (req.last_long_term > last_log.term
-                || (req.last_long_term == last_log.term && req.last_log_index > last_log.index))
+            && (req.last_log_term > last_log.term
+                || (req.last_log_term == last_log.term && req.last_log_index > last_log.index))
         {
             reply.voted = true;
-            self.voted_for.store(req.candidate_id as i32, SeqCst);
-            *self.election_reset_event.write().await = Some(SystemTime::now());
+            self.voted_for = req.candidate_id as i32;
+            self.election_reset_event = Some(SystemTime::now());
         } else {
             reply.voted = false;
         }
 
         reply.term = current_term;
-        self.persist_state();
+        self.persist_state().await;
         debug!("reply to RequestForVote: {}", reply.voted);
 
         Ok(reply)
     }
 
-    pub async fn append_entries(
-        &self,
-        req: AppendEntries,
-    ) -> Result<AppendEntriesReply, ConsensusError> {
-        if *self.state.read().await == State::Dead {
-            return Err(ConsensusError::DeadNode);
+    async fn _append_entries(&mut self, req: AppendEntries) -> anyhow::Result<AppendEntriesReply> {
+        if self.state == State::Dead {
+            return Err(anyhow::format_err!("node is dead"));
         }
 
         debug!("append_entries: {:?}", req);
 
-        let current_term = self.current_term.load(SeqCst);
+        let current_term = self.current_term;
         let mut reply = AppendEntriesReply {
             success: false,
             ..Default::default()
         };
 
         if req.term > current_term {
-            debug!("outdated term in RequestForVote");
+            debug!("outdated term in append_entries");
             self.become_follower(req.term).await;
         }
 
         if req.term == current_term {
-            if *self.state.read().await != State::Follower {
-                self.become_follower(req.term);
+            if self.state != State::Follower {
+                self.become_follower(req.term).await;
             }
 
-            *self.election_reset_event.write().await = Some(SystemTime::now());
+            self.election_reset_event = Some(SystemTime::now());
 
-            let curr_logs = self.logs.read().await;
-            if req.prev_log_index == -1
-                || (req.prev_log_index < curr_logs.len() as i32
-                    && req.prev_log_term == curr_logs[req.prev_log_index as usize].term)
+            if req.prev_log_index == 0
+                || (req.prev_log_index < self.logs.len()
+                    && req.prev_log_term == self.logs[req.prev_log_index as usize].term)
             {
                 reply.success = true;
 
                 let mut insert_index = req.prev_log_index as usize + 1;
                 let mut new_index = 0;
 
-                while (insert_index < curr_logs.len() && new_index <= req.entries.len())
-                    && (curr_logs[insert_index].term == req.entries[new_index].term)
+                while (insert_index < self.logs.len() && new_index <= req.entries.len())
+                    && (self.logs[insert_index].term == req.entries[new_index].term)
                 {
                     insert_index += 1;
                     new_index += 1;
@@ -289,35 +377,28 @@ impl Consensus {
                 if new_index < req.entries.len() {
                     debug!("inserting new entries from index {}", insert_index);
                     self.logs
-                        .write()
-                        .await
                         .splice(insert_index.., req.entries[new_index..].iter().cloned());
                 }
 
-                let curr_commit_index = self.commit_index.load(SeqCst);
-                if req.leader_commit > curr_commit_index {
-                    self.commit_index.store(
-                        curr_commit_index.min(self.logs.read().await.len() as i32 - 1),
-                        SeqCst,
-                    );
+                if req.leader_commit > self.commit_index {
+                    self.commit_index = self.commit_index.min(self.logs.len() as i32 - 1);
+                    // self.new_commit_ntfy.notify_waiters(); // NOTE
+                    let _ = self.tx.send(ConsensusMsg::SendCommit).await;
                 }
-
-                self.new_commit_ntfy.notify_waiters();
             }
         } else {
-            let logs = self.logs.read().await;
-            if req.prev_log_index > logs.len() as i32 {
-                reply.conflict_index = logs.len() as i32;
+            if req.prev_log_index > self.logs.len() {
+                reply.conflict_index = self.logs.len() as i32;
                 reply.conflict_term = -1;
             } else {
-                reply.conflict_term = logs[req.prev_log_index as usize].term as i32;
+                reply.conflict_term = self.logs[req.prev_log_index as usize].term as i32;
 
                 let mut index = req.prev_log_index;
-                while index >= 0 && logs[index as usize].term as i32 != reply.conflict_term {
+                while index >= 0 && self.logs[index as usize].term as i32 != reply.conflict_term {
                     index -= 1;
                 }
 
-                reply.conflict_index = index + 1;
+                reply.conflict_index = index as i32 + 1;
             }
         }
 
@@ -330,74 +411,342 @@ impl Consensus {
         time::Duration::from_millis(rand::thread_rng().gen_range(150..=300))
     }
 
-    async fn run_election_timer(&self) {
+    async fn run_election_timer(&mut self) {
         let tm_duration = self.generate_timout();
-        let starting_term = self.current_term.load(SeqCst);
-        // TODO: log
+        let starting_term = self.current_term;
+        info!(
+            "election timer started {:?}, term={}",
+            tm_duration, starting_term
+        );
 
         let mut timer = interval(tm_duration);
-        loop {
-            timer.tick().await;
-            let curr_state = *self.state.read().await;
-
-            if curr_state != State::Candidate && curr_state != State::Follower {
-                return;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            loop {
+                timer.tick().await;
+                let _ = tx
+                    .send(ConsensusMsg::StartElection(starting_term, tm_duration))
+                    .await;
+                // let curr_state = self.state;
+                //
+                // if curr_state != State::Candidate && curr_state != State::Follower {
+                //     return;
+                // }
+                //
+                // if starting_term != self.current_term {
+                //     return;
+                // }
+                //
+                // if let Some(election_event) = self.election_reset_event {
+                //     if SystemTime::now()
+                //         .duration_since(election_event)
+                //         .unwrap_or(Duration::from_secs(0))
+                //         >= tm_duration
+                //     {
+                //         // self.start_election().await;
+                //         return;
+                //     }
+                // }
             }
+        });
+    }
 
-            let current_term = self.current_term.load(SeqCst);
-            if starting_term != current_term {
-                return;
+    async fn start_election(&mut self) {
+        self.state = State::Candidate;
+        self.current_term += 1;
+        self.election_reset_event = Some(SystemTime::now());
+        self.voted_for = self.id as i32;
+
+        let mut votes = 1;
+
+        let candidate_id = self.id;
+        let peers = self.peers.clone();
+        for (peer_id, client) in peers {
+            let last_log = self.last_log().await;
+            let req = RequestVote {
+                term: self.current_term,
+                candidate_id: candidate_id,
+                last_log_index: last_log.index,
+                last_log_term: last_log.term,
+            };
+
+            info!("sending RequestVote to {}: {:?}", peer_id, req);
+
+            if let Ok(reply) = client
+                .call::<RequestVoteReply>("request_vote".to_string(), &req)
+                .await
+            {
+                debug!("received request vote reply: {:?}", reply);
+
+                if self.state == State::Candidate {
+                    debug!("while waiting for reply, state = {:?}", self.state);
+                    continue;
+                }
+
+                if reply.term > self.current_term {
+                    debug!("term out of date in request vote reply");
+                    self.become_follower(reply.term).await;
+                    continue;
+                } else if reply.term == self.current_term {
+                    if reply.voted {
+                        votes += 1;
+                        if votes * 2 > self.peers.len() + 1 {
+                            debug!("won election with {} votes", votes);
+                            self.start_leader().await;
+                        }
+                    }
+                }
             }
+        }
 
-            if let Some(election_event) = *self.election_reset_event.read().await {
-                if SystemTime::now()
-                    .duration_since(election_event)
-                    .unwrap_or(Duration::from_secs(0))
-                    >= tm_duration
-                {
-                    self.start_election().await;
+        // TODO
+        // tokio::task::spawn_local(async move {
+        // self.run_election_timer().await;
+        // });
+    }
+
+    async fn become_follower(&mut self, term: usize) {
+        debug!("stepped down as Follower with term={}", term);
+        self.state = State::Follower;
+        self.current_term = term;
+        self.voted_for = -1;
+        self.election_reset_event = Some(SystemTime::now());
+
+        // TODO
+        // tokio::task::spawn_local(async move {
+        // self.run_election_timer().await;
+        // });
+    }
+
+    async fn start_leader(&mut self) {
+        self.state = State::Leader;
+
+        for (peer_id, _) in &self.peers {
+            self.next_index.insert(*peer_id, self.logs.len());
+            self.match_index.insert(*peer_id, 0);
+        }
+        debug!(
+            "became Leader: term={}, nextIndex={:?}, matchIndex={:?}",
+            self.current_term, self.next_index, self.match_index,
+        );
+
+        let heartbeat = Duration::from_millis(50);
+        let _ = self.tx.send(ConsensusMsg::SendAES).await;
+        let mut timer = interval(heartbeat);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            loop {
+                timer.tick().await;
+                let _ = tx.send(ConsensusMsg::SendAES).await;
+                // let mut do_send = false;
+                // tokio::select! {
+                //     _ = timer.tick() => {
+                //         // do_send = true;
+                //         timer.reset();
+                //     }
+                //     // NOTE
+                //     _ = self.ae_trigger.notified() => {
+                //         do_send = true;
+                //     }
+                // }
+                //
+                // if do_send {
+                //     if self.state != State::Leader {
+                //         return;
+                //     }
+                //
+                //     self.send_leader_aes().await;
+                // }
+            }
+        });
+    }
+
+    async fn send_leader_aes(&mut self) {
+        if self.state != State::Leader {
+            return;
+        }
+        let saved_curr_term = self.current_term;
+
+        for (peer_id, client) in self.peers.iter() {
+            let ni = *self.next_index.get(&peer_id).unwrap_or(&0);
+            let prev_log_index = ni - 1;
+            let mut prev_log_term = 0;
+            if prev_log_index >= 0 {
+                prev_log_term = self.logs[prev_log_index].term;
+            }
+            let entries = &self.logs[ni..];
+
+            let req = AppendEntries {
+                term: saved_curr_term,
+                leader: self.id,
+                prev_log_index: prev_log_index,
+                prev_log_term: prev_log_term,
+                entries: entries.to_vec(),
+                leader_commit: self.commit_index,
+            };
+            debug!(
+                "sending append entries to {}: ni={}, req={:?}",
+                peer_id, ni, req
+            );
+
+            if let Ok(reply) = client
+                .call::<AppendEntriesReply>("append_entries".to_string(), &req)
+                .await
+            {
+                if reply.term > self.current_term {
+                    debug!("term out of date in append entries reply");
+                    self.become_follower(reply.term).await;
                     return;
+                }
+
+                if self.state == State::Leader && saved_curr_term == reply.term {
+                    if reply.success {
+                        self.next_index.insert(*peer_id, ni + entries.len());
+                        self.match_index
+                            .insert(*peer_id, self.next_index[&peer_id] - 1);
+
+                        let saved_commit_index = self.commit_index as usize;
+                        for i in saved_commit_index + 1..self.logs.len() {
+                            if self.logs[i].term == self.commit_index as usize {
+                                let mut match_count = 1;
+                                for (pid, _) in &self.peers {
+                                    if self.match_index[pid] >= i {
+                                        match_count += 1;
+                                    }
+                                }
+
+                                if match_count * 2 > self.peers.len() + 1 {
+                                    self.commit_index = i as i32;
+                                }
+                            }
+                        }
+
+                        debug!("append_entries reply from {} success: nextIndex = {:?}, matchIndex = {:?}; commitIndex = {}", peer_id, self.next_index, self.match_index, self.commit_index);
+
+                        let curr_commit_index = self.commit_index;
+                        if curr_commit_index != saved_commit_index as i32 {
+                            debug!("leader set commit_index = {}", curr_commit_index);
+                            // NOTE
+                            // self.new_commit_ntfy.notify_waiters();
+                            // self.ae_trigger.notify_waiters();
+                            let _ = self.tx.send(ConsensusMsg::SendCommit).await;
+                            let _ = self.tx.send(ConsensusMsg::SendAES).await;
+                        }
+                    } else {
+                        if reply.conflict_term >= 0 {
+                            let mut last_term_index = -1;
+                            for i in (0..self.logs.len()).rev() {
+                                if self.logs[i].term == reply.conflict_term as usize {
+                                    last_term_index = i as i32;
+                                    break;
+                                }
+                            }
+                            if last_term_index >= 0 {
+                                self.next_index
+                                    .insert(*peer_id, last_term_index as usize + 1);
+                            } else {
+                                self.next_index
+                                    .insert(*peer_id, reply.conflict_index as usize);
+                            }
+                        } else {
+                            self.next_index
+                                .insert(*peer_id, reply.conflict_index as usize);
+                        }
+
+                        debug!(
+                            "append_entries reply from {} !success: nextIndex := {}",
+                            peer_id,
+                            ni - 1
+                        );
+                    }
                 }
             }
         }
     }
 
-    async fn start_election(&self) {
-        *self.state.write().await = State::Candidate;
-        let current_term = self.current_term.fetch_add(1, SeqCst);
-        *self.election_reset_event.write().await = Some(SystemTime::now());
-        self.voted_for.store(self.id as i32, SeqCst);
-
-        let mut votes = 1;
-
-        // for peer in self.peers.clone().into_iter() {
-        //     tokio::spawn(async move {
-        //         let last_log = self.last_log().await;
-        //
-        //         let args = RequestVote{
-        //             term: current_term,
-        //             candidate_id: self.id,
-        //             last_log_index: last_log.index,
-        //             last_long_term: last_log.term,
-        //         };
-        //
-        //         info!("sending RequestVote to {}: {:?}", peer, args);
-        //
-        //         //let mut reply = ;
-        //     });
-        // }
-    }
-
-    async fn become_follower(&self, term: usize) {}
-
     async fn last_log(&self) -> CommitEntry {
-        CommitEntry {
-            index: 0,
-            term: 0,
-            command: String::new(),
+        if self.logs.len() > 0 {
+            CommitEntry {
+                index: self.logs.len() - 1,
+                term: self.logs.last().unwrap().term,
+                command: String::new(),
+            }
+        } else {
+            CommitEntry {
+                index: 0,
+                term: 0,
+                command: String::new(),
+            }
         }
     }
 
-    // TODO: should spawn its own coroutine
-    fn start_sending_commits(&self) {}
+    async fn send_commits(&mut self, commit_chan_tx: mpsc::Sender<CommitEntry>) {
+        // tokio::spawn(async move {
+        //     loop {
+        // self.new_commit_ntfy.notified().await;
+        let saved_term = self.current_term;
+        let saved_last_applied = self.last_applied.unwrap_or(0);
+
+        let mut entries = Vec::new();
+        if self.commit_index as usize > self.last_applied.unwrap_or(0) {
+            entries.append(
+                self.logs[self.last_applied.unwrap_or(0) + 1..self.commit_index as usize + 1]
+                    .to_vec()
+                    .as_mut(),
+            );
+            self.last_applied = Some(self.commit_index as usize);
+        }
+        debug!(
+            "commit_chan_sender entries={:?}, saved_last_applied={}",
+            entries, saved_last_applied
+        );
+
+        for (i, entry) in entries.into_iter().enumerate() {
+            debug!("sending on commit_chan i={}, entry={:?}", i, entry);
+            let _ = commit_chan_tx
+                .send(CommitEntry {
+                    command: entry.command,
+                    index: saved_last_applied + i + 1,
+                    term: saved_term,
+                })
+                .await;
+        }
+        // }
+        // });
+        // debug!("commit_chan_sender done")
+    }
+}
+
+#[rpc_impl]
+impl ConsensusRPC {
+    #[rpc_func]
+    pub async fn request_vote(&'static self, req: RequestVote) -> anyhow::Result<RequestVoteReply> {
+        let (tx, mut rx) = mpsc::channel(32);
+        let _ = self.tx.send(ConsensusMsg::RequestVote(req, tx)).await;
+
+        if let Ok(res) =
+            tokio::time::timeout(Duration::from_secs_f32(1.0), async { rx.recv().await }).await
+        {
+            res.unwrap()
+        } else {
+            Err(anyhow::format_err!("request timed out"))
+        }
+    }
+
+    #[rpc_func]
+    pub async fn append_entries(
+        &'static self,
+        req: AppendEntries,
+    ) -> anyhow::Result<AppendEntriesReply> {
+        let (tx, mut rx) = mpsc::channel(32);
+        let _ = self.tx.send(ConsensusMsg::AppendEntry(req, tx)).await;
+
+        if let Ok(res) =
+            tokio::time::timeout(Duration::from_secs_f32(1.0), async { rx.recv().await }).await
+        {
+            res.unwrap()
+        } else {
+            Err(anyhow::format_err!("request timed out"))
+        }
+    }
 }
