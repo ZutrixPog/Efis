@@ -1,11 +1,9 @@
-use efis::rpc::client::Client;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::subscriber;
+use tracing::{subscriber, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use efis::consensus::Consensus;
@@ -21,7 +19,7 @@ struct Config {
     port: String,
     backup_interval: Option<u64>,
     backup_path: Option<String>,
-    peers: Vec<String>,
+    peers: Option<Vec<String>>,
 }
 
 async fn run_rpc(cfg: Config) {
@@ -30,24 +28,28 @@ async fn run_rpc(cfg: Config) {
         backup_dur = Some(Duration::from_secs(interval));
     }
 
-    let store = DatastoreGuard::new(backup_dur, cfg.backup_path).await;
+    let store = DatastoreGuard::new(backup_dur, cfg.backup_path.clone()).await;
     let pubsub = PubSubGuard::new();
 
     // Consensus
-    let con_storage = ConFileStorage::new(PathBuf::from_str("/var/efis").unwrap());
-    let (commit_chan_tx, commit_chan_rx) = mpsc::channel(1024);
-
-    let (cons, crpc) = Consensus::singleton(0, con_storage).await;
-    tokio::spawn(async {
-        cons.start(cfg.peers, commit_chan_tx).await;
-    });
-
-    let efis = Efis::singleton(store, pubsub);
+    let con_path = cfg.backup_path.unwrap_or("/tmp/efis".to_string());
+    let con_storage = ConFileStorage::new(PathBuf::from_str(&con_path).unwrap());
 
     let rpc_server = RpcServer::new();
 
+    let mut chandle = None;
+    if let Some(peers) = cfg.peers {
+        let (mut cons, crpc) = Consensus::new(0, con_storage).await;
+        tokio::spawn(async move {
+            cons.start(peers).await;
+        });
+
+        rpc_server.register_struct(crpc).await;
+        chandle = Some(crpc);
+    }
+
+    let efis = Efis::singleton(store, pubsub, chandle);
     rpc_server.register_struct(efis).await;
-    rpc_server.register_struct(crpc).await;
 
     _ = rpc_server
         .run(format!("0.0.0.0:{}", cfg.port).as_str())
@@ -58,7 +60,9 @@ async fn run_rpc(cfg: Config) {
 pub async fn main() -> anyhow::Result<()> {
     let config = envy::from_env::<Config>().expect("please provide the required information!");
 
-    let subscriber = FmtSubscriber::new();
+    let subscriber = FmtSubscriber::builder()
+        // .with_max_level(Level::DEBUG)
+        .finish();
     subscriber::set_global_default(subscriber)?;
 
     run_rpc(config).await;

@@ -179,6 +179,6 @@ mod tests {
         while let Some(msg) = res_chan.as_mut().unwrap().recv().await {
             vals.push(msg);
         }
-        assert_eq!(4, vals.len());
+        assert_eq!(5, vals.len());
     }
 }

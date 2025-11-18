@@ -6,7 +6,7 @@ use crate::{
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
@@ -18,6 +18,12 @@ pub struct ConFileStorage {
 
 impl ConFileStorage {
     pub fn new(filepath: PathBuf) -> Arc<dyn Storage + Sync + Send> {
+        tokio::spawn({
+            let fp_clone = filepath.clone();
+            async move {
+                let _ = fs::create_dir_all(fp_clone).await;
+            }
+        });
         Arc::new(ConFileStorage { path: filepath })
     }
 }
@@ -66,7 +72,7 @@ mod tests {
     async fn test_store_restore() {
         let test_state = PersistentState {
             current_term: 1,
-            voted_for: 3,
+            voted_for: Some(3),
             logs: vec![],
         };
 

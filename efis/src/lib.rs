@@ -1,4 +1,3 @@
-mod client;
 pub mod consensus;
 pub mod efis;
 pub mod errors;

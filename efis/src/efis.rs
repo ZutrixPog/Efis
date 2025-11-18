@@ -7,7 +7,7 @@ use std::sync::{Arc, Once};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
-use crate::consensus::Consensus;
+use crate::consensus::{Consensus, ConsensusHandle};
 use crate::efis::types::{GetRes, OkRes};
 use crate::errors::{DatastoreError, ServiceError};
 use crate::pubsub::PubSubGuard;
@@ -94,24 +94,34 @@ mod types {
 pub struct Efis {
     store: DatastoreGuard,
     pub pubsub: PubSubGuard,
+    cons: Option<&'static ConsensusHandle>,
 }
 
 #[rpc_impl]
 impl Efis {
-    pub fn new(ds: DatastoreGuard, ps: PubSubGuard) -> Self {
+    pub fn new(
+        ds: DatastoreGuard,
+        ps: PubSubGuard,
+        cons: Option<&'static ConsensusHandle>,
+    ) -> Self {
         Self {
             store: ds,
             pubsub: ps,
+            cons,
         }
     }
 
-    pub fn singleton(ds: DatastoreGuard, ps: PubSubGuard) -> &'static Self {
+    pub fn singleton(
+        ds: DatastoreGuard,
+        ps: PubSubGuard,
+        cons: Option<&'static ConsensusHandle>,
+    ) -> &'static Self {
         static mut SINGLETON: MaybeUninit<Efis> = MaybeUninit::uninit();
         static ONCE: Once = Once::new();
 
         unsafe {
             ONCE.call_once(|| {
-                let singleton = Self::new(ds, ps);
+                let singleton = Self::new(ds, ps, cons);
                 SINGLETON.write(singleton);
             });
 
@@ -127,6 +137,10 @@ impl Efis {
             .store()
             .set(req.key, Value::Text(req.value), duration)
             .map_err(|_| ServiceError::ErrorWrite);
+
+        if let Some(c) = self.cons {
+            c.submit("command".to_string()).await;
+        }
 
         if res.is_err() {
             Err(anyhow::anyhow!(res.unwrap_err()))
@@ -523,20 +537,18 @@ mod tests {
     use super::*;
     use crate::storage::consensus::ConFileStorage;
     use crate::store::DatastoreGuard;
-    use tokio::sync::mpsc;
 
     async fn setup() -> &'static Efis {
         let sguard = DatastoreGuard::new(None, None).await;
         let pguard = PubSubGuard::new();
 
         let con_storage = ConFileStorage::new(PathBuf::from_str("/var/efis").unwrap());
-        let (commit_chan_tx, commit_chan_rx) = mpsc::channel(1024);
-        let (cons, crpc) = Consensus::singleton(0, con_storage).await;
+        let (mut cons, crpc) = Consensus::new(0, con_storage).await;
         tokio::spawn(async move {
-            cons.start(vec![], commit_chan_tx).await;
+            cons.start(vec![]).await;
         });
 
-        Efis::singleton(sguard, pguard)
+        Efis::singleton(sguard, pguard, None)
     }
 
     #[tokio::test]
