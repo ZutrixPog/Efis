@@ -4,8 +4,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
-use crate::rpc::{Deserialize, ErrorRes, Serialize};
-
 use super::RpcStruct;
 
 pub type RpcFunc = dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>
@@ -18,9 +16,12 @@ pub type RpcStreamFunc = dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::R
     + Sync
     + 'static;
 
+pub type MiddlewareFunc = dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
+
 pub struct Dispatcher {
     rpcs: HashMap<String, Arc<RpcFunc>>,
     streams: HashMap<String, Arc<RpcStreamFunc>>,
+    middlewares: Vec<Arc<MiddlewareFunc>>,
 }
 
 impl Dispatcher {
@@ -28,6 +29,7 @@ impl Dispatcher {
         Arc::new(RwLock::new(Self {
             rpcs: HashMap::new(),
             streams: HashMap::new(),
+            middlewares: Vec::new(),
         }))
     }
 
@@ -44,10 +46,18 @@ impl Dispatcher {
         st.register_fns(self);
     }
 
+    pub fn middleware(&mut self, middle: Arc<MiddlewareFunc>) {
+        self.middlewares.push(middle);
+    }
+
     pub async fn dispatch_rpc(&self, req: &[u8]) -> anyhow::Result<Vec<u8>> {
         let req_str = String::from_utf8_lossy(req);
         let mut parts = req_str.split(" ").collect::<Vec<&str>>();
         let method = parts.remove(0);
+
+        for middleware in self.middlewares.iter() {
+            middleware(String::from_utf8(req.to_vec()).unwrap()).await;
+        }
 
         let rpc_fn = self
             .rpcs

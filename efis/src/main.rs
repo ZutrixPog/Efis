@@ -1,8 +1,10 @@
+use core::arch;
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tracing::{subscriber, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -37,9 +39,10 @@ async fn run_rpc(cfg: Config) {
 
     let rpc_server = RpcServer::new();
 
+    let id = (cfg.port.chars().last().unwrap() as u8 - '0' as u8) as usize;
     let mut chandle = None;
     if let Some(peers) = cfg.peers {
-        let (mut cons, crpc) = Consensus::new(0, con_storage).await;
+        let (mut cons, crpc) = Consensus::new(id, con_storage).await;
         tokio::spawn(async move {
             cons.start(peers).await;
         });

@@ -1,47 +1,78 @@
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::any;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use macros::{rpc_func, rpc_impl, rpc_stream, rpc_struct};
 use std::mem::MaybeUninit;
-use std::sync::{Arc, Once};
-use tokio::sync::mpsc;
+use std::sync::Once;
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::Duration;
+use tracing::error;
 
-use crate::consensus::{Consensus, ConsensusHandle};
-use crate::efis::types::{GetRes, OkRes};
+use crate::commands::Command;
+use crate::consensus::{CommitEntry, ConsensusHandle};
+use crate::efis::types::{GetRes, OkRes, SetReq};
 use crate::errors::{DatastoreError, ServiceError};
 use crate::pubsub::PubSubGuard;
 use crate::rpc::{dispatcher::Dispatcher, RpcStruct};
 use crate::rpc::{Deserialize, Serialize};
 use crate::store::{DatastoreGuard, Value};
 
-mod types {
+macro_rules! handle_commands {
+    ($self_var:ident, $cmd_var:ident, $( $cmd:ident => $func:ident ),* $(,)? ) => {
+        match $cmd_var.command {
+            $(
+                Command::$cmd(req) => {
+                    let res = $self_var.$func(req);
+                    if let Some(ch) = $self_var.subs.read().await.get(&$cmd_var.index) {
+                        let lr = match res {
+                            Ok(val) => {
+                                let any_val = &val as &dyn std::any::Any;
+                                if let Some(okres) = any_val.downcast_ref::<OkRes>() {
+                                    LateRes::Ok(okres.clone())
+                                } else if let Some(getres) = any_val.downcast_ref::<GetRes<String>>() {
+                                    LateRes::Value(getres.clone())
+                                } else {
+                                    LateRes::Err("internal error".to_string())
+                                }
+                            }
+                            Err(err) => LateRes::Err(err.to_string()),
+                        };
+                        let _ = ch.send(lr);
+                    }
+                }
+            )*
+            Command::Unknown => {}
+        }
+    };
+}
+
+pub mod types {
     use crate::rpc::{Deserialize, Serialize};
     use macros::SerDe;
 
-    #[derive(SerDe)]
+    #[derive(Clone, SerDe)]
     pub struct OkRes {
         pub status: String,
     }
 
-    #[derive(SerDe)]
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, SerDe)]
     pub struct SetReq {
         pub key: String,
         pub value: String,
         pub exp: Option<u64>,
     }
 
-    #[derive(SerDe)]
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, SerDe)]
     pub struct GetReq {
         pub key: String,
     }
 
-    #[derive(SerDe)]
+    #[derive(Clone, SerDe)]
     pub struct GetRes<T: Serialize> {
         pub val: T,
     }
 
-    #[derive(SerDe)]
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, SerDe)]
     pub struct ExpireReq {
         pub key: String,
         pub duration: u64,
@@ -52,13 +83,13 @@ mod types {
         pub ttl: String,
     }
 
-    #[derive(SerDe)]
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, SerDe)]
     pub struct ListReq {
         pub key: String,
         pub values: Vec<String>,
     }
 
-    #[derive(SerDe)]
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, SerDe)]
     pub struct MapReq {
         pub key: String,
         pub score: i64,
@@ -89,12 +120,20 @@ mod types {
     }
 }
 
-//#[derive(Debug)]
+#[derive(Clone)]
+enum LateRes {
+    Ok(OkRes),
+    Value(GetRes<String>),
+    Err(String),
+}
+
 #[rpc_struct]
 pub struct Efis {
     store: DatastoreGuard,
     pub pubsub: PubSubGuard,
     cons: Option<&'static ConsensusHandle>,
+    cmd_ch_tx: broadcast::Sender<CommitEntry>,
+    subs: RwLock<HashMap<usize, broadcast::Sender<LateRes>>>,
 }
 
 #[rpc_impl]
@@ -104,11 +143,16 @@ impl Efis {
         ps: PubSubGuard,
         cons: Option<&'static ConsensusHandle>,
     ) -> Self {
-        Self {
+        let (tx, _) = broadcast::channel(64);
+        let s = Self {
             store: ds,
             pubsub: ps,
             cons,
-        }
+            cmd_ch_tx: tx,
+            subs: RwLock::new(HashMap::new()),
+        };
+
+        s
     }
 
     pub fn singleton(
@@ -125,22 +169,86 @@ impl Efis {
                 SINGLETON.write(singleton);
             });
 
-            SINGLETON.assume_init_ref()
+            let s = SINGLETON.assume_init_ref();
+            s.process_cmd();
+            s
+        }
+    }
+
+    fn process_cmd(&'static self) {
+        tokio::spawn(async move {
+            let mut rx = if let Some(cons) = self.cons {
+                cons.subscribe()
+            } else {
+                self.cmd_ch_tx.subscribe()
+            };
+
+            loop {
+                match rx.recv().await {
+                    Ok(cmd) => {
+                        handle_commands!(self, cmd,
+                            Set       => _set,
+                            Delete    => _delete,
+                            Increment => _increment,
+                            Decrement => _decrement,
+                            Expire    => _expire,
+                            Lpush     => _lpush,
+                            Lpop      => _lpop,
+                            Rpush     => _rpush,
+                            Rpop      => _rpop,
+                            Sadd      => _sadd,
+                            Zadd      => _zadd,
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+    }
+
+    async fn handle_consensus(&self, cmd: Command) -> LateRes {
+        let cons = self.cons.unwrap();
+        if let Some(index) = cons.submit(cmd).await {
+            let (tx, rx) = broadcast::channel(16);
+
+            self.subs.write().await.insert(index, tx);
+
+            let mut sub = rx.resubscribe();
+
+            let res =
+                tokio::time::timeout(Duration::from_secs(5), async { sub.recv().await }).await;
+
+            match res {
+                Ok(Ok(lres)) => lres,
+                Ok(Err(_)) => LateRes::Err("broadcast recv error".to_string()),
+                Err(_) => LateRes::Err("request timed out".to_string()),
+            }
+        } else {
+            LateRes::Err("consensus failed".to_string())
         }
     }
 
     #[rpc_func]
-    fn set(&'static self, req: types::SetReq) -> anyhow::Result<types::OkRes> {
+    async fn set(&'static self, req: types::SetReq) -> anyhow::Result<types::OkRes> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Set(req)).await {
+                LateRes::Ok(ok) => Ok(ok),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._set(req)
+        }
+    }
+
+    fn _set(&self, req: types::SetReq) -> anyhow::Result<types::OkRes> {
         let duration = req.exp.map(Duration::from_secs);
         let res = self
             .store
             .store()
-            .set(req.key, Value::Text(req.value), duration)
+            .set(req.key.clone(), Value::Text(req.value.clone()), duration)
             .map_err(|_| ServiceError::ErrorWrite);
-
-        if let Some(c) = self.cons {
-            c.submit("command".to_string()).await;
-        }
 
         if res.is_err() {
             Err(anyhow::anyhow!(res.unwrap_err()))
@@ -171,7 +279,19 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn delete(&'static self, req: types::GetReq) -> anyhow::Result<types::OkRes> {
+    async fn delete(&'static self, req: types::GetReq) -> anyhow::Result<types::OkRes> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Delete(req)).await {
+                LateRes::Ok(ok) => Ok(ok),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._delete(req)
+        }
+    }
+
+    fn _delete(&self, req: types::GetReq) -> anyhow::Result<types::OkRes> {
         let res = self
             .store
             .store()
@@ -189,7 +309,19 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn increment(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn increment(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Increment(req)).await {
+                LateRes::Value(val) => Ok(val),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._increment(req)
+        }
+    }
+
+    fn _increment(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
         let mut store = self.store.store();
         let res = store
             .modify(req.key.as_str(), |value| {
@@ -225,7 +357,19 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn decrement(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn decrement(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Decrement(req)).await {
+                LateRes::Value(val) => Ok(val),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._decrement(req)
+        }
+    }
+
+    fn _decrement(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
         let mut store = self.store.store();
         store
             .modify(req.key.as_str(), |value| {
@@ -257,7 +401,19 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn expire(&'static self, req: types::ExpireReq) -> anyhow::Result<OkRes> {
+    async fn expire(&'static self, req: types::ExpireReq) -> anyhow::Result<OkRes> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Expire(req)).await {
+                LateRes::Ok(ok) => Ok(ok),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._expire(req)
+        }
+    }
+
+    fn _expire(&self, req: types::ExpireReq) -> anyhow::Result<OkRes> {
         let res = self
             .store
             .store()
@@ -300,7 +456,19 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn lpush(&'static self, req: types::ListReq) -> anyhow::Result<OkRes> {
+    async fn lpush(&'static self, req: types::ListReq) -> anyhow::Result<OkRes> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Lpush(req)).await {
+                LateRes::Ok(ok) => Ok(ok),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._lpush(req)
+        }
+    }
+
+    fn _lpush(&self, req: types::ListReq) -> anyhow::Result<OkRes> {
         let mut store = self.store.store();
         store
             .set(req.key.clone(), Value::List(VecDeque::new()), None)
@@ -328,7 +496,19 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn rpush(&'static self, req: types::ListReq) -> anyhow::Result<types::OkRes> {
+    async fn rpush(&'static self, req: types::ListReq) -> anyhow::Result<types::OkRes> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Rpush(req)).await {
+                LateRes::Ok(ok) => Ok(ok),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._rpush(req)
+        }
+    }
+
+    fn _rpush(&self, req: types::ListReq) -> anyhow::Result<types::OkRes> {
         let mut store = self.store.store();
         store
             .set(req.key.clone(), Value::List(VecDeque::new()), None)
@@ -355,14 +535,25 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn lpop(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn lpop(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Lpop(req)).await {
+                LateRes::Value(val) => Ok(val),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._lpop(req)
+        }
+    }
+
+    fn _lpop(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
         let mut res = Err(ServiceError::ErrorWrite);
         self.store
             .store()
             .modify(req.key.as_str(), |list| {
                 if let Value::List(list_data) = list {
                     if let Some(value) = list_data.pop_front() {
-                        println!("{}", value.clone());
                         res = Ok(value);
                     }
                 }
@@ -380,7 +571,19 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn rpop(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn rpop(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Rpop(req)).await {
+                LateRes::Value(val) => Ok(val),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._rpop(req)
+        }
+    }
+
+    fn _rpop(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
         let mut res = Err(ServiceError::ErrorWrite);
         self.store
             .store()
@@ -404,7 +607,19 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn sadd(&'static self, req: types::ListReq) -> anyhow::Result<OkRes> {
+    async fn sadd(&'static self, req: types::ListReq) -> anyhow::Result<OkRes> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Sadd(req)).await {
+                LateRes::Ok(ok) => Ok(ok),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._sadd(req)
+        }
+    }
+
+    fn _sadd(&self, req: types::ListReq) -> anyhow::Result<OkRes> {
         let mut store = self.store.store();
         store
             .set(req.key.clone(), Value::Set(HashSet::new()), None)
@@ -450,7 +665,19 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn zadd(&'static self, req: types::MapReq) -> anyhow::Result<types::OkRes> {
+    async fn zadd(&'static self, req: types::MapReq) -> anyhow::Result<types::OkRes> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Zadd(req)).await {
+                LateRes::Ok(ok) => Ok(ok),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._zadd(req)
+        }
+    }
+
+    fn _zadd(&self, req: types::MapReq) -> anyhow::Result<types::OkRes> {
         let mut store = self.store.store();
         store
             .set(req.key.clone(), Value::SortedSet(BTreeMap::new()), None)
@@ -535,6 +762,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+    use crate::consensus::Consensus;
     use crate::storage::consensus::ConFileStorage;
     use crate::store::DatastoreGuard;
 

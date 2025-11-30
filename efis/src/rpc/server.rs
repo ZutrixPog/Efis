@@ -6,7 +6,7 @@ use tokio::time::{self, Duration};
 use tracing::{error, info, instrument, warn};
 
 use crate::errors::RpcError;
-use crate::rpc::dispatcher::{Dispatcher, RpcFunc, RpcStreamFunc};
+use crate::rpc::dispatcher::{Dispatcher, MiddlewareFunc, RpcFunc, RpcStreamFunc};
 use crate::rpc::{ErrorRes, RpcStruct, Serialize};
 
 const MAX_CONNECTIONS: usize = 1000;
@@ -57,9 +57,6 @@ impl RpcServer {
                     error!(cause = %err, "failed to accept");
                 }
             }
-            // _ = shutdown => {
-            //     info!("shutting down");
-            // }
         }
 
         let Listener {
@@ -88,6 +85,40 @@ impl RpcServer {
 
     pub async fn register_struct(&self, st: &'static dyn RpcStruct) {
         self.dispatcher.write().await.register_struct(st);
+    }
+
+    pub async fn middleware(&self, middle: Arc<MiddlewareFunc>) {
+        self.dispatcher.write().await.middleware(middle);
+    }
+
+    pub async fn register_input_stream(&self, mut rx: broadcast::Receiver<String>) {
+        let dispatcher = self.dispatcher.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        let buf = msg.as_bytes();
+                        println!("{:?}", msg);
+
+                        let reader = dispatcher.read().await;
+                        if let Err(err) = reader.dispatch_rpc(buf).await {
+                            error!("failed to dispatch internal message: {}", err);
+                        }
+                    }
+
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("lagged by {} messages", n);
+                        continue;
+                    }
+
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("sender closed; input task exiting");
+                        break;
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -167,7 +198,8 @@ impl Handler {
                     let err_msg = ErrorRes {
                         error: err.to_string(),
                     }
-                    .serialize()+ "\n";
+                    .serialize()
+                        + "\n";
                     let _ = self.socket.write(err_msg.as_bytes()).await;
                     continue;
                 }
@@ -178,7 +210,8 @@ impl Handler {
                 let err_msg = ErrorRes {
                     error: err.to_string(),
                 }
-                .serialize() + "\n";
+                .serialize()
+                    + "\n";
                 let _ = self.socket.write(err_msg.as_bytes()).await;
                 continue;
             }
