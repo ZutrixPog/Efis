@@ -73,6 +73,7 @@ mod tests {
         let test_state = PersistentState {
             current_term: 1,
             voted_for: Some(3),
+            last_applied: None,
             logs: vec![],
         };
 

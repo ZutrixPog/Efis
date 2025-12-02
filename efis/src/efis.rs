@@ -6,7 +6,7 @@ use std::mem::MaybeUninit;
 use std::sync::Once;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::Duration;
-use tracing::error;
+use tracing::warn;
 
 use crate::commands::Command;
 use crate::consensus::{CommitEntry, ConsensusHandle};
@@ -108,7 +108,7 @@ pub mod types {
         pub vals: Vec<String>,
     }
 
-    #[derive(SerDe)]
+    #[derive(Debug, Clone, PartialEq, SerDe, serde::Serialize, serde::Deserialize)]
     pub struct PubReq {
         pub chan: String,
         pub value: String,
@@ -198,6 +198,7 @@ impl Efis {
                             Rpop      => _rpop,
                             Sadd      => _sadd,
                             Zadd      => _zadd,
+                            Publish   => _publish,
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -732,14 +733,25 @@ impl Efis {
 
     #[rpc_func]
     fn publish(&'static self, req: types::PubReq) -> anyhow::Result<OkRes> {
-        let sent = self.pubsub.ps().publish(req.chan, req.value);
-        if sent > 0 {
-            Ok(types::OkRes {
-                status: "ok".to_string(),
-            })
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::Publish(req)).await {
+                LateRes::Ok(ok) => Ok(ok),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
         } else {
-            Err(anyhow::anyhow!(ServiceError::ErrorPublish))
+            self._publish(req)
         }
+    }
+
+    fn _publish(&'static self, req: types::PubReq) -> anyhow::Result<OkRes> {
+        let sent = self.pubsub.ps().publish(req.chan, req.value);
+        if sent == 0 && self.cons.is_none() {
+            return Err(anyhow::anyhow!(ServiceError::ErrorPublish));
+        }
+        Ok(types::OkRes {
+            status: "ok".to_string(),
+        })
     }
 
     #[rpc_stream]
@@ -747,8 +759,8 @@ impl Efis {
         let (tx, rx) = mpsc::channel(10);
         let mut sub = self.pubsub.ps().subscribe(req.chan);
         tokio::spawn(async move {
-            while let Ok(mut msg) = sub.recv().await {
-                tx.send(msg).await;
+            while let Ok(msg) = sub.recv().await {
+                let _ = tx.send(msg).await;
             }
         });
 
@@ -1060,36 +1072,21 @@ mod tests {
     async fn test_zrange() {
         let store_service = setup().await;
 
-        let _ = store_service
-            .zadd(
-                types::MapReq {
-                    key: "key_zrng".to_string(),
-                    score: 3,
-                    value: "value1".to_string(),
-                }
-                .serialize(),
-            )
-            .await;
-        let _ = store_service
-            .zadd(
-                types::MapReq {
-                    key: "key_zrng".to_string(),
-                    score: 2,
-                    value: "value2".to_string(),
-                }
-                .serialize(),
-            )
-            .await;
-        let _ = store_service
-            .zadd(
-                types::MapReq {
-                    key: "key_zrng".to_string(),
-                    score: 1,
-                    value: "value3".to_string(),
-                }
-                .serialize(),
-            )
-            .await;
+        let _ = store_service._zadd(types::MapReq {
+            key: "key_zrng".to_string(),
+            score: 3,
+            value: "value1".to_string(),
+        });
+        let _ = store_service._zadd(types::MapReq {
+            key: "key_zrng".to_string(),
+            score: 2,
+            value: "value2".to_string(),
+        });
+        let _ = store_service._zadd(types::MapReq {
+            key: "key_zrng".to_string(),
+            score: 1,
+            value: "value3".to_string(),
+        });
 
         let req = types::MapRange {
             key: "key_zrng".to_string(),

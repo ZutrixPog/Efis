@@ -42,6 +42,7 @@ pub struct PersistentState {
     pub current_term: usize,
     pub voted_for: Option<usize>,
     pub logs: Vec<LogEntry>,
+    pub last_applied: Option<usize>,
 }
 
 #[async_trait]
@@ -292,6 +293,7 @@ impl Consensus {
     async fn restore_state(&mut self) {
         if let Ok(old_state) = self.storage.restore().await {
             self.current_term = old_state.current_term;
+            self.last_applied = old_state.last_applied;
             self.logs = old_state.logs;
             self.voted_for = old_state.voted_for;
         } else {
@@ -306,6 +308,7 @@ impl Consensus {
                 current_term: self.current_term,
                 voted_for: self.voted_for,
                 logs: self.logs.clone(),
+                last_applied: self.last_applied,
             })
             .await;
 
@@ -519,7 +522,8 @@ impl Consensus {
                 } else if reply.term == self.current_term {
                     if reply.voted {
                         votes += 1;
-                        let cluster_size = self.peers.len() + 1;
+                        let cluster_size =
+                            self.peers.iter().filter(|(_, p)| p.connected()).count() + 1;
                         if votes * 2 > cluster_size {
                             info!("won election with {} votes", votes);
                             self.start_leader().await;
@@ -628,7 +632,7 @@ impl Consensus {
                         .send(ConsensusMsg::AppendEntryResult(peer_id, ni, reply))
                         .await;
                 } else {
-                    error!("failed to send append entry: {:?}", res.err());
+                    debug!("failed to send append entry: {:?}", res.err());
                 }
             });
         }
@@ -843,6 +847,7 @@ mod tests {
             current_term: 0,
             voted_for: None,
             logs: Vec::new(),
+            last_applied: None,
         };
         let storage = Arc::new(MockStorage::new_with(ps));
         let c = Consensus::new(id, storage).await;
@@ -854,6 +859,7 @@ mod tests {
         let persisted = PersistentState {
             current_term: 42,
             voted_for: Some(5),
+            last_applied: None,
             logs: vec![
                 LogEntry {
                     command: Command::Unknown,
@@ -983,6 +989,7 @@ mod tests {
             current_term: 7,
             voted_for: None,
             logs: Vec::new(),
+            last_applied: None,
         };
         let storage = Arc::new(MockStorage::new_with(initial.clone()));
         let (mut c, _) = Consensus::new(3, storage.clone()).await;

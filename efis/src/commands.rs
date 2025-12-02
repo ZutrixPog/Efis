@@ -1,5 +1,5 @@
 use crate::{
-    efis::types::{ExpireReq, GetReq, ListReq, MapReq, SetReq},
+    efis::types::{ExpireReq, GetReq, ListReq, MapReq, PubReq, SetReq},
     rpc::{Deserialize, Serialize},
 };
 
@@ -16,6 +16,7 @@ pub enum Command {
     Rpop(GetReq),
     Sadd(ListReq),
     Zadd(MapReq),
+    Publish(PubReq),
     Unknown,
 }
 
@@ -33,6 +34,7 @@ impl Serialize for Command {
             Command::Rpop(req) => format!("Rpop({})", req.serialize()),
             Command::Sadd(req) => format!("Sadd({})", req.serialize()),
             Command::Zadd(req) => format!("Zadd({})", req.serialize()),
+            Command::Publish(req) => format!("Publish({})", req.serialize()),
             Command::Unknown => "Unknown".into(),
         }
     }
@@ -46,7 +48,7 @@ impl Deserialize for Command {
             return match s {
                 "Unknown" => Ok(Command::Unknown),
                 "Set" | "Delete" | "Increment" | "Decrement" | "Expire" | "Lpush" | "Lpop"
-                | "Rpush" | "Rpop" | "Sadd" | "Zadd" => {
+                | "Rpush" | "Rpop" | "Sadd" | "Zadd" | "Publish" => {
                     Err(format!("Variant '{}' requires payload", s))
                 }
                 _ => Ok(Command::Unknown),
@@ -90,6 +92,7 @@ impl Deserialize for Command {
             "Rpop" => Ok(Command::Rpop(GetReq::deserialize(inner)?)),
             "Sadd" => Ok(Command::Sadd(ListReq::deserialize(inner)?)),
             "Zadd" => Ok(Command::Zadd(MapReq::deserialize(inner)?)),
+            "Publish" => Ok(Command::Publish(PubReq::deserialize(inner)?)),
             "Unknown" => Ok(Command::Unknown),
             _ => Ok(Command::Unknown),
         }

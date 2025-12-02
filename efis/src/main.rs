@@ -33,7 +33,6 @@ async fn run_rpc(cfg: Config) {
     let store = DatastoreGuard::new(backup_dur, cfg.backup_path.clone()).await;
     let pubsub = PubSubGuard::new();
 
-    // Consensus
     let con_path = cfg.backup_path.unwrap_or("/tmp/efis".to_string());
     let con_storage = ConFileStorage::new(PathBuf::from_str(&con_path).unwrap());
 

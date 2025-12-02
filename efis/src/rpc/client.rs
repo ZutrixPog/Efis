@@ -1,8 +1,10 @@
 use std::time::Duration;
 
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, RwLock};
 use tracing::error;
 
 use crate::rpc::{Deserialize, ErrorRes};
@@ -15,22 +17,74 @@ const BUFF_SIZE: usize = 512;
 // TODO: add auth
 pub struct Client {
     addr: String,
-    conn: Mutex<TcpStream>,
+    conn: Arc<RwLock<TcpStream>>,
+    trigger: mpsc::Sender<()>,
+    connected: Arc<AtomicPtr<bool>>,
 }
 
 impl Client {
     pub async fn connect(addr: String) -> Self {
+        let (tx, mut rx) = mpsc::channel(8);
         let mut conn = TcpStream::connect(addr.clone()).await;
         while conn.is_err() {
             error!("failed to connect to peer");
             conn = TcpStream::connect(addr.clone()).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+        let conn = Arc::new(RwLock::new(conn.unwrap()));
 
-        Client {
-            addr: addr,
-            conn: Mutex::new(conn.unwrap()),
+        let addr_clone = addr.clone();
+        let conn_clone = conn.clone();
+        let connected = &mut true;
+        let connected_ptr = Arc::new(AtomicPtr::new(connected));
+
+        let connected_ptr_clone = connected_ptr.clone();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_millis(100);
+            let max = Duration::from_secs(5);
+
+            loop {
+                if rx.recv().await.is_none() {
+                    return;
+                }
+
+                unsafe {
+                    *connected_ptr_clone.load(Ordering::Relaxed) = false;
+                }
+                loop {
+                    match TcpStream::connect(&addr_clone).await {
+                        Ok(s) => {
+                            *conn_clone.write().await = s;
+                            backoff = Duration::from_millis(100);
+                            unsafe {
+                                *connected_ptr_clone.load(Ordering::Relaxed) = true;
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            let sleep = tokio::time::sleep(backoff);
+                            tokio::select! {
+                                _ = sleep => {},
+                                Some(_) = rx.recv() => {},
+                            }
+
+                            backoff = (backoff * 2).min(max);
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            addr,
+            conn,
+            trigger: tx,
+            connected: connected_ptr,
         }
+    }
+
+    pub fn connected(&self) -> bool {
+        unsafe { *self.connected.as_ref().load(Ordering::Relaxed) }
     }
 
     pub async fn call<T: Deserialize>(
@@ -38,27 +92,46 @@ impl Client {
         method: String,
         req: &dyn Serialize,
     ) -> anyhow::Result<T> {
-        let req = format!("{} {}\n", method, req.serialize()).into_bytes();
+        let packet = format!("{} {}\n", method, req.serialize()).into_bytes();
 
-        let mut conn = self.conn.lock().await;
-        conn.write_all(&req).await?;
-        conn.flush().await?;
+        for _ in 0..1 {
+            let mut conn = self.conn.as_ref().write().await;
 
-        let mut buff = vec![0u8; BUFF_SIZE];
-        let n = tokio::time::timeout(
-            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            conn.read(&mut buff),
-        )
-        .await??;
-        buff = buff[..n].to_vec();
+            if conn.write_all(&packet).await.is_err() {
+                let _ = self.trigger.send(()).await;
+                continue;
+            }
 
-        let res_str = String::from_utf8(buff)?;
+            if conn.flush().await.is_err() {
+                let _ = self.trigger.send(()).await;
+                continue;
+            }
 
-        if let Ok(err_res) = ErrorRes::deserialize(&res_str) {
-            return Err(anyhow::anyhow!(err_res.error));
+            let mut buff = vec![0u8; BUFF_SIZE];
+            let res = tokio::time::timeout(
+                Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+                conn.read(&mut buff),
+            )
+            .await;
+
+            let n = match res {
+                Ok(Ok(n)) => n,
+                _ => {
+                    let _ = self.trigger.send(()).await;
+                    continue;
+                }
+            };
+
+            let res_str = String::from_utf8_lossy(&buff[..n]).to_string();
+
+            if let Ok(err) = ErrorRes::deserialize(&res_str) {
+                return Err(anyhow::anyhow!(err.error));
+            }
+
+            return T::deserialize(&res_str).map_err(anyhow::Error::msg);
         }
 
-        T::deserialize(&res_str).map_err(|e| anyhow::anyhow!(e))
+        anyhow::bail!("failed to connect after retries")
     }
 
     pub async fn call_stream<T: Deserialize + Send + Sync + 'static>(
@@ -69,32 +142,34 @@ impl Client {
         let req = format!("{} {}\n", method, req.serialize()).into_bytes();
 
         let (tx, rx) = mpsc::channel(10);
+
         let mut conn = TcpStream::connect(self.addr.clone()).await?;
 
         tokio::spawn(async move {
-            _ = conn.write_all(&req).await;
-            _ = conn.flush().await;
+            let _ = conn.write_all(&req).await;
+            let _ = conn.flush().await;
 
             let mut buff = vec![0u8; BUFF_SIZE];
-            while let Ok(n) = conn.read(&mut buff).await {
-                buff = buff[..n].to_vec();
 
-                let res = String::from_utf8(buff.clone());
-                if res.is_err() {
-                    return;
-                }
-                let res_str = res.unwrap();
+            loop {
+                let n = match conn.read(&mut buff).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
 
-                let msgs = res_str.split("\n");
-                for msg in msgs {
+                let part = &buff[..n];
+                let Ok(s) = String::from_utf8(part.to_vec()) else {
+                    break;
+                };
+
+                for msg in s.split("\n") {
                     if msg.starts_with("done") {
                         drop(tx);
                         return;
                     }
-
-                    let msg = T::deserialize(&msg);
-                    if let Ok(msg) = msg {
-                        _ = tx.send(msg).await;
+                    if let Ok(v) = T::deserialize(&msg) {
+                        let _ = tx.send(v).await;
                     }
                 }
             }
