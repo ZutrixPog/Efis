@@ -1,4 +1,3 @@
-use std::any;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use macros::{rpc_func, rpc_impl, rpc_stream, rpc_struct};
@@ -6,11 +5,10 @@ use std::mem::MaybeUninit;
 use std::sync::Once;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::Duration;
-use tracing::warn;
 
 use crate::commands::Command;
 use crate::consensus::{CommitEntry, ConsensusHandle};
-use crate::efis::types::{GetRes, OkRes, SetReq};
+use crate::efis::types::{GetRes, OkRes};
 use crate::errors::{DatastoreError, ServiceError};
 use crate::pubsub::PubSubGuard;
 use crate::rpc::{dispatcher::Dispatcher, RpcStruct};
@@ -716,7 +714,10 @@ impl Efis {
                         .iter()
                         .map(|(k, v)| (v.clone(), k.clone()))
                         .collect();
-                    let range = req.start..=req.end;
+                    if req.end > req.start {
+                        return Ok(vec![]);
+                    }
+                    let range = req.start..req.end;
                     let range_values: Vec<String> =
                         zset_vec[range].iter().map(|(v, _)| v.clone()).collect();
                     Ok(range_values)
@@ -783,7 +784,7 @@ mod tests {
         let pguard = PubSubGuard::new();
 
         let con_storage = ConFileStorage::new(PathBuf::from_str("/var/efis").unwrap());
-        let (mut cons, crpc) = Consensus::new(0, con_storage).await;
+        let (mut cons, _) = Consensus::new("0".to_string(), con_storage).await;
         tokio::spawn(async move {
             cons.start(vec![]).await;
         });
@@ -873,7 +874,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_decrement() {
-        let mut store_service = setup().await;
+        let store_service = setup().await;
 
         let set_req = types::SetReq {
             key: "key_decr".to_string(),
@@ -928,7 +929,7 @@ mod tests {
             ttl: "9".to_string(),
         };
 
-        store_service.set(set_req.serialize()).await;
+        _ = store_service.set(set_req.serialize()).await;
         let result = store_service.ttl(ttl_req.serialize()).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), ttl_res.serialize());

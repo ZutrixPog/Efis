@@ -8,7 +8,7 @@ use std::{path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, error, info, warn};
+use tracing::error;
 
 const FILE_NAME: &str = "cons";
 
@@ -72,7 +72,7 @@ mod tests {
     async fn test_store_restore() {
         let test_state = PersistentState {
             current_term: 1,
-            voted_for: Some(3),
+            voted_for: Some("3".to_string()),
             last_applied: None,
             logs: vec![],
         };

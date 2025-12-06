@@ -40,7 +40,7 @@ pub struct CommitEntry {
 #[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PersistentState {
     pub current_term: usize,
-    pub voted_for: Option<usize>,
+    pub voted_for: Option<String>,
     pub logs: Vec<LogEntry>,
     pub last_applied: Option<usize>,
 }
@@ -54,7 +54,7 @@ pub trait Storage {
 #[derive(Debug, SerDe)]
 pub struct RequestVote {
     pub term: usize,
-    pub candidate_id: usize,
+    pub candidate_id: String,
     pub last_log_index: usize,
     pub last_log_term: usize,
 }
@@ -68,7 +68,7 @@ pub struct RequestVoteReply {
 #[derive(Debug, Default, PartialEq, SerDe)]
 pub struct AppendEntries {
     pub term: usize,
-    pub leader: usize,
+    pub leader: String,
 
     pub prev_log_index: Option<usize>,
     pub prev_log_term: Option<usize>,
@@ -100,7 +100,7 @@ enum ConsensusMsg {
 }
 
 pub struct Consensus {
-    id: usize,
+    id: String,
     peers: Vec<(usize, Arc<Client>)>,
     storage: Arc<dyn Storage + Send + Sync>,
     rx: mpsc::Receiver<ConsensusMsg>,
@@ -109,7 +109,7 @@ pub struct Consensus {
     shutdown_ntfy: Notify,
 
     current_term: usize,
-    voted_for: Option<usize>,
+    voted_for: Option<String>,
     logs: Vec<LogEntry>,
 
     commit_index: Option<usize>,
@@ -133,7 +133,7 @@ pub struct ConsensusHandle {
 #[rpc_impl]
 impl Consensus {
     pub async fn new(
-        id: usize,
+        id: String,
         storage: Arc<dyn Storage + Send + Sync>,
     ) -> (Self, &'static ConsensusHandle) {
         let (tx, rx) = mpsc::channel(1024);
@@ -264,8 +264,8 @@ impl Consensus {
         }
     }
 
-    pub async fn report(&self) -> (usize, usize, State) {
-        (self.id, self.current_term, self.state)
+    pub async fn report(&self) -> (String, usize, State) {
+        (self.id.clone(), self.current_term, self.state)
     }
 
     async fn _submit(&mut self, cmd: Command) -> usize {
@@ -306,7 +306,7 @@ impl Consensus {
             .storage
             .store(PersistentState {
                 current_term: self.current_term,
-                voted_for: self.voted_for,
+                voted_for: self.voted_for.clone(),
                 logs: self.logs.clone(),
                 last_applied: self.last_applied,
             })
@@ -337,7 +337,7 @@ impl Consensus {
             voted: false,
         };
 
-        let voted_for = self.voted_for;
+        let voted_for = self.voted_for.clone();
         let up_to_date = (req.last_log_term > last_log.term)
             || (req.last_log_term == last_log.term && req.last_log_index >= last_log.index);
 
@@ -353,7 +353,7 @@ impl Consensus {
             reply.voted = false;
         }
 
-        info!("reply to RequestForVote: {:?}", reply.voted);
+        debug!("reply to RequestForVote: {:?}", reply.voted);
         Ok(reply)
     }
 
@@ -456,7 +456,7 @@ impl Consensus {
 
         let tm_duration = self.generate_timout();
         let starting_term = self.current_term;
-        info!(
+        debug!(
             "election timer started {:?}, term={}",
             tm_duration, starting_term
         );
@@ -480,29 +480,27 @@ impl Consensus {
         if let Some(h) = self.heartbeat_handle.take() {
             h.abort();
         }
-        info!("starting a election");
 
         self.state = State::Candidate;
         self.current_term += 1;
         self.election_reset_event = Some(SystemTime::now());
-        self.voted_for = Some(self.id);
+        self.voted_for = Some(self.id.clone());
         self.persist_state().await;
 
         let mut votes = 1usize;
 
-        let candidate_id = self.id;
         let peers = self.peers.clone();
 
         for (peer_id, client) in peers {
             let last_log = self.last_log().await;
             let req = RequestVote {
                 term: self.current_term,
-                candidate_id,
+                candidate_id: self.id.clone(),
                 last_log_index: last_log.index,
                 last_log_term: last_log.term,
             };
 
-            info!("sending RequestVote to {}: {:?}", peer_id, req);
+            debug!("sending RequestVote to {}: {:?}", peer_id, req);
 
             let res = client
                 .call::<RequestVoteReply>("request_vote".to_string(), &req)
@@ -516,7 +514,7 @@ impl Consensus {
                 }
 
                 if reply.term > self.current_term {
-                    debug!("term out of date in request vote reply");
+                    warn!("term out of date in request vote reply");
                     self.become_follower(reply.term).await;
                     continue;
                 } else if reply.term == self.current_term {
@@ -594,7 +592,6 @@ impl Consensus {
         }
         let saved_curr_term = self.current_term;
         let commit_index = self.commit_index;
-        let leader_id = self.id;
 
         for (peer_id, client) in self.peers.iter() {
             let client = client.clone();
@@ -607,12 +604,13 @@ impl Consensus {
             let prev_log_index = ni.checked_sub(1);
             let prev_log_term = prev_log_index.map(|i| self.logs[i].term);
             let entries = self.logs[ni..].to_vec();
+            let leader_id = self.id.clone();
 
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 let req = AppendEntries {
                     term: saved_curr_term,
-                    leader: leader_id,
+                    leader: leader_id.clone(),
                     prev_log_index,
                     prev_log_term,
                     entries: entries,
@@ -842,7 +840,7 @@ mod tests {
         }
     }
 
-    async fn make_consensus(id: usize) -> Consensus {
+    async fn make_consensus(id: String) -> Consensus {
         let ps = PersistentState {
             current_term: 0,
             voted_for: None,
@@ -858,7 +856,7 @@ mod tests {
     async fn test_restore_state() {
         let persisted = PersistentState {
             current_term: 42,
-            voted_for: Some(5),
+            voted_for: Some("5".to_string()),
             last_applied: None,
             logs: vec![
                 LogEntry {
@@ -872,7 +870,7 @@ mod tests {
             ],
         };
         let storage = Arc::new(MockStorage::new_with(persisted.clone()));
-        let (c, _) = Consensus::new(1, storage.clone()).await;
+        let (c, _) = Consensus::new("1".to_string(), storage.clone()).await;
 
         assert_eq!(
             c.current_term, persisted.current_term,
@@ -887,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_vote_granted_when_up_to_date_and_not_voted() {
-        let mut c = make_consensus(1).await;
+        let mut c = make_consensus("1".to_string()).await;
 
         c.current_term = 1;
         c.logs.push(LogEntry {
@@ -897,7 +895,7 @@ mod tests {
 
         let req = RequestVote {
             term: 1,
-            candidate_id: 2,
+            candidate_id: "2".to_string(),
             last_log_index: 0,
             last_log_term: 1,
         };
@@ -906,20 +904,20 @@ mod tests {
         assert!(res.voted, "should vote for up-to-date candidate");
         assert_eq!(
             c.voted_for,
-            Some(2),
+            Some("2".to_string()),
             "voted_for should be set to candidate id"
         );
     }
 
     #[tokio::test]
     async fn test_append_entries_accepts_and_appends_entries_and_updates_commit() {
-        let mut c = make_consensus(1).await;
+        let mut c = make_consensus("1".to_string()).await;
 
         assert!(c.logs.is_empty());
 
         let req = AppendEntries {
             term: 1,
-            leader: 2,
+            leader: "2".to_string(),
             prev_log_index: None,
             prev_log_term: None,
             entries: vec![LogEntry {
@@ -947,7 +945,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_commits_sends_committed_entries() {
-        let mut c = make_consensus(1).await;
+        let mut c = make_consensus("1".to_string()).await;
 
         c.logs.push(LogEntry {
             command: Command::Unknown,
@@ -992,7 +990,7 @@ mod tests {
             last_applied: None,
         };
         let storage = Arc::new(MockStorage::new_with(initial.clone()));
-        let (mut c, _) = Consensus::new(3, storage.clone()).await;
+        let (mut c, _) = Consensus::new("3".to_string(), storage.clone()).await;
 
         c.state = State::Leader;
         c.current_term = 7;
@@ -1020,7 +1018,7 @@ mod tests {
 
         let req = AppendEntries {
             term: 1,
-            leader: 4,
+            leader: "4".to_string(),
             prev_log_index: None,
             prev_log_term: None,
             entries: vec![LogEntry {

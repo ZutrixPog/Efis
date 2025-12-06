@@ -41,7 +41,6 @@ impl Dispatcher {
         self.streams.insert(method, stream_fn);
     }
 
-    // TODO: RpcStruct should be automatically implemented
     pub fn register_struct(&mut self, st: &'static dyn RpcStruct) {
         st.register_fns(self);
     }
@@ -53,7 +52,7 @@ impl Dispatcher {
     pub async fn dispatch_rpc(&self, req: &[u8]) -> anyhow::Result<Vec<u8>> {
         let req_str = String::from_utf8_lossy(req);
         let mut parts = req_str.split(" ").collect::<Vec<&str>>();
-        let method = parts.remove(0);
+        let method = parts.remove(0).trim();
 
         for middleware in self.middlewares.iter() {
             middleware(String::from_utf8(req.to_vec()).unwrap()).await;
@@ -72,7 +71,11 @@ impl Dispatcher {
     pub async fn dispatch_stream(&self, req: &[u8]) -> anyhow::Result<mpsc::Receiver<String>> {
         let req_str = String::from_utf8_lossy(req);
         let mut parts = req_str.split(" ").collect::<Vec<&str>>();
-        let method = parts.remove(0);
+        let method = parts.remove(0).trim();
+
+        for middleware in self.middlewares.iter() {
+            middleware(String::from_utf8(req.to_vec()).unwrap()).await;
+        }
 
         let stream_fn = self
             .streams

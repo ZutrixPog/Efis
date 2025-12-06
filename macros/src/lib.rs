@@ -1,5 +1,4 @@
 extern crate proc_macro;
-use std::fmt::format;
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -242,8 +241,10 @@ pub fn rpc_stream(_attr: TokenStream, item: TokenStream) -> TokenStream {
             fn #fn_name(#self_arg, req: String)
                 -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<::tokio::sync::mpsc::Receiver<String>>> + Send>>
             {
-                let req = #req_type::deserialize(req.as_str()).unwrap();
                 Box::pin(async move {
+                     let req = #req_type::deserialize(req.as_str())
+                        .map_err(|e| ::anyhow::anyhow!("Failed to deserialize request: {}", e))?;
+
                     let result: #output_type = #fn_body;
                     result.map(|rx| {
                         let (tx2, rx2) = ::tokio::sync::mpsc::channel(10);
@@ -265,8 +266,10 @@ pub fn rpc_stream(_attr: TokenStream, item: TokenStream) -> TokenStream {
             fn #fn_name(req: String)
                 -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<::tokio::sync::mpsc::Receiver<String>>> + Send>>
             {
-                let req = #req_type::deserialize(req.as_str()).unwrap();
                 Box::pin(async move {
+                    let req = #req_type::deserialize(req.as_str())
+                        .map_err(|e| ::anyhow::anyhow!("Failed to deserialize request: {}", e))?;
+
                     let result: #output_type = #fn_body;
                     result.map(|rx| {
                         let (tx2, rx2) = ::tokio::sync::mpsc::channel(10);
@@ -291,7 +294,6 @@ pub fn rpc_stream(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn rpc_struct(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemStruct);
-    let struct_name = &input.ident;
 
     let expanded = quote! {
         #input
@@ -305,7 +307,6 @@ pub fn rpc_impl(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemImpl);
 
     let ty = &input.self_ty;
-    let ty_str = quote!(#ty).to_string();
 
     let mut rpc_methods = Vec::new();
 
