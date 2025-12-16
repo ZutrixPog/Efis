@@ -9,9 +9,9 @@ use tokio::sync::broadcast;
 use tokio::time::{interval, Duration};
 use tracing::{error, info};
 
-use crate::errors::*;
 use crate::serializer::{decode, encode};
 use crate::storage::backup::FileBackupRepo;
+use crate::vector::flat::FlatIndex;
 
 const PATH: &str = "./backup";
 pub type Key = String;
@@ -22,6 +22,7 @@ pub enum Value {
     List(VecDeque<String>),
     Set(HashSet<String>),
     SortedSet(BTreeMap<i64, String>),
+    Vector(FlatIndex),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -129,9 +130,9 @@ impl Datastore {
         }
     }
 
-    fn encode(&self) -> Result<Vec<u8>, DatastoreError> {
+    fn encode(&self) -> anyhow::Result<Vec<u8>> {
         let data = self.data.lock().unwrap();
-        encode(data.clone()).map_err(|_| DatastoreError::Other("couldn't encode".to_string()))
+        encode(data.clone()).map_err(|_| anyhow::format_err!("couldn't encode"))
     }
 
     pub fn shutdown_purge_task(&self) {
@@ -147,7 +148,7 @@ impl Datastore {
         key: String,
         value: Value,
         expiry: Option<Duration>,
-    ) -> Result<(), DatastoreError> {
+    ) -> anyhow::Result<()> {
         let item = Item {
             value: value,
             expiry: expiry.map(|d| SystemTime::now() + d),
@@ -173,33 +174,33 @@ impl Datastore {
         }
     }
 
-    pub fn remove(&mut self, key: &str) -> Result<(), DatastoreError> {
+    pub fn remove(&mut self, key: &str) -> anyhow::Result<()> {
         let mut data = self.data.lock().unwrap();
         if data.remove(key).is_some() {
             Ok(())
         } else {
-            Err(DatastoreError::KeyNotFound)
+            Err(anyhow::format_err!("key not found"))
         }
     }
 
-    pub fn expire(&mut self, key: &str, duration: Duration) -> Result<(), DatastoreError> {
+    pub fn expire(&mut self, key: &str, duration: Duration) -> anyhow::Result<()> {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get_mut(key) {
             item.expiry = Some(SystemTime::now() + duration);
             Ok(())
         } else {
-            Err(DatastoreError::KeyNotFound)
+            Err(anyhow::format_err!("key not found"))
         }
     }
 
-    pub fn ttl(&self, key: &str) -> Result<Option<Duration>, DatastoreError> {
+    pub fn ttl(&self, key: &str) -> anyhow::Result<Option<Duration>> {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get(key) {
             if let Some(expiry) = item.expiry {
                 let now = SystemTime::now();
                 if now >= expiry {
                     data.remove(key);
-                    return Err(DatastoreError::KeyExpired);
+                    return Err(anyhow::format_err!("key expired"));
                 }
                 if let Ok(duration) = expiry.duration_since(now) {
                     Ok(Some(duration))
@@ -210,21 +211,21 @@ impl Datastore {
                 Ok(None)
             }
         } else {
-            Err(DatastoreError::KeyNotFound)
+            Err(anyhow::format_err!("key not found"))
         }
     }
 
-    pub fn modify<F>(&mut self, key: &str, modifier: F) -> Result<(), DatastoreError>
+    pub fn modify<F>(&mut self, key: &str, modifier: F) -> anyhow::Result<()>
     where
-        F: FnOnce(&mut Value),
+        F: FnOnce(&mut Value) -> anyhow::Result<()>,
     {
         let mut data = self.data.lock().unwrap();
         if let Some(item) = data.get_mut(key) {
             let value = &mut item.value;
-            modifier(value);
+            modifier(value)?;
             Ok(())
         } else {
-            Err(DatastoreError::KeyNotFound)
+            Err(anyhow::format_err!("key not found"))
         }
     }
 }
@@ -321,7 +322,7 @@ mod tests {
         let _ = datastore.set("key2".to_owned(), Value::Text("value2".to_owned()), None);
 
         assert!(datastore.ttl("key1").is_ok());
-        assert_eq!(datastore.ttl("key2"), Ok(None));
+        assert!(datastore.ttl("key2").is_ok());
 
         std::thread::sleep(Duration::from_secs(4));
 
@@ -340,6 +341,7 @@ mod tests {
             if let Value::Text(ref mut v) = value {
                 *v = "new_value".to_owned();
             }
+            Ok(())
         });
 
         assert!(res.is_ok());

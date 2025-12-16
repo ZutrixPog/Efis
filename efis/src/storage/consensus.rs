@@ -1,6 +1,5 @@
 use crate::{
     consensus::{PersistentState, Storage},
-    errors::PersistError,
     serializer::{decode, encode},
 };
 use std::{path::PathBuf, sync::Arc};
@@ -8,7 +7,6 @@ use std::{path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::error;
 
 const FILE_NAME: &str = "cons";
 
@@ -37,11 +35,7 @@ impl Storage for ConFileStorage {
             .write(true)
             .create(true)
             .open(path)
-            .await
-            .map_err(|err| {
-                error!("{}", err.to_string());
-                PersistError::ErrorSave
-            })?;
+            .await?;
 
         let data = encode(state)?;
 

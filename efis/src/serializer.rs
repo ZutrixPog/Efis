@@ -1,16 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-use crate::errors::SerializerError;
-
-pub fn encode<T: Serialize>(input: T) -> Result<Vec<u8>, SerializerError> {
-    bincode::serialize(&input).map_err(|_| SerializerError::InvalidValueType)
+pub fn encode<T: Serialize>(input: T) -> anyhow::Result<Vec<u8>> {
+    bincode::serialize(&input).map_err(|_| anyhow::format_err!("invalid type"))
 }
 
-pub fn decode<'a, T: Deserialize<'a>>(encoded: &'a Vec<u8>) -> Result<T, SerializerError> {
+pub fn decode<'a, T: Deserialize<'a>>(encoded: &'a Vec<u8>) -> anyhow::Result<T> {
     if let Ok(decoded) = bincode::deserialize::<T>(&encoded[..]) {
         Ok(decoded)
     } else {
-        Err(SerializerError::InvalidValueType)
+        Err(anyhow::format_err!("invalid type"))
     }
-
 }

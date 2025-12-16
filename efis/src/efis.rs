@@ -8,12 +8,13 @@ use tokio::time::Duration;
 
 use crate::commands::Command;
 use crate::consensus::{CommitEntry, ConsensusHandle};
-use crate::efis::types::{GetRes, OkRes};
-use crate::errors::{DatastoreError, ServiceError};
+use crate::efis::types::{GetRes, OkRes, VSearchRes};
 use crate::pubsub::PubSubGuard;
 use crate::rpc::{dispatcher::Dispatcher, RpcStruct};
 use crate::rpc::{Deserialize, Serialize};
 use crate::store::{DatastoreGuard, Value};
+use crate::vector::flat::FlatIndex;
+use crate::vector::{cosine_sim, Index};
 
 macro_rules! handle_commands {
     ($self_var:ident, $cmd_var:ident, $( $cmd:ident => $func:ident ),* $(,)? ) => {
@@ -116,6 +117,31 @@ pub mod types {
     pub struct SubReq {
         pub chan: String,
     }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, SerDe)]
+    pub struct VSetReq {
+        pub key: String,
+        pub id: String,
+        pub vec: Vec<f32>,
+    }
+
+    #[derive(SerDe)]
+    pub struct VSearchReq {
+        pub key: String,
+        pub query: Vec<f32>,
+        pub k: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, SerDe)]
+    pub struct VDelReq {
+        pub key: String,
+        pub id: String,
+    }
+
+    #[derive(SerDe)]
+    pub struct VSearchRes {
+        pub ids: Vec<String>,
+    }
 }
 
 #[derive(Clone)]
@@ -197,6 +223,8 @@ impl Efis {
                             Sadd      => _sadd,
                             Zadd      => _zadd,
                             Publish   => _publish,
+                            VSet      => _vset,
+                            VDel      => _vdel,
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -246,8 +274,7 @@ impl Efis {
         let res = self
             .store
             .store()
-            .set(req.key.clone(), Value::Text(req.value.clone()), duration)
-            .map_err(|_| ServiceError::ErrorWrite);
+            .set(req.key.clone(), Value::Text(req.value.clone()), duration);
 
         if res.is_err() {
             Err(anyhow::anyhow!(res.unwrap_err()))
@@ -264,10 +291,10 @@ impl Efis {
             .store
             .store()
             .get(req.key.as_str())
-            .ok_or(ServiceError::KeyNotFound)
+            .ok_or(anyhow::format_err!("key not found: {}", req.key))
             .and_then(|value| match value {
                 Value::Text(text) => Ok(text),
-                _ => Err(ServiceError::InvalidValueType),
+                _ => Err(anyhow::format_err!("invalid type")),
             });
 
         if res.is_err() {
@@ -295,7 +322,7 @@ impl Efis {
             .store
             .store()
             .remove(req.key.as_str())
-            .map_err(|_| ServiceError::KeyNotFound)
+            .map_err(|_| anyhow::format_err!("key not found: {}", req.key))
             .map(|_| ());
 
         if res.is_err() {
@@ -322,19 +349,15 @@ impl Efis {
 
     fn _increment(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
         let mut store = self.store.store();
-        let res = store
-            .modify(req.key.as_str(), |value| {
-                if let Value::Text(val) = value {
-                    if let Ok(num) = val.parse::<f64>() {
-                        val.clear();
-                        val.extend((num + 1.0).to_string().chars())
-                    }
+        let res = store.modify(req.key.as_str(), |value| {
+            if let Value::Text(val) = value {
+                if let Ok(num) = val.parse::<f64>() {
+                    val.clear();
+                    val.extend((num + 1.0).to_string().chars())
                 }
-            })
-            .map_err(|err| match err {
-                DatastoreError::KeyNotFound => ServiceError::KeyNotFound,
-                _ => ServiceError::ErrorWrite,
-            });
+            }
+            Ok(())
+        });
 
         if res.is_err() {
             return Err(anyhow::anyhow!(res.unwrap_err()));
@@ -342,10 +365,10 @@ impl Efis {
 
         let res = store
             .get(req.key.as_str())
-            .ok_or(ServiceError::KeyNotFound)
+            .ok_or(anyhow::format_err!("key not found"))
             .and_then(|value| match value {
                 Value::Text(val) => Ok(val),
-                _ => Err(ServiceError::InvalidValueType),
+                _ => Err(anyhow::format_err!("invalid type")),
             });
 
         if res.is_err() {
@@ -370,26 +393,22 @@ impl Efis {
 
     fn _decrement(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
         let mut store = self.store.store();
-        store
-            .modify(req.key.as_str(), |value| {
-                if let Value::Text(val) = value {
-                    if let Ok(num) = val.parse::<f64>() {
-                        val.clear();
-                        val.extend((num - 1.0).to_string().chars())
-                    }
+        store.modify(req.key.as_str(), |value| {
+            if let Value::Text(val) = value {
+                if let Ok(num) = val.parse::<f64>() {
+                    val.clear();
+                    val.extend((num - 1.0).to_string().chars())
                 }
-            })
-            .map_err(|err| match err {
-                DatastoreError::KeyNotFound => ServiceError::KeyNotFound,
-                _ => ServiceError::ErrorWrite,
-            })?;
+            }
+            Ok(())
+        })?;
 
         let res = store
             .get(req.key.as_str())
-            .ok_or(ServiceError::KeyNotFound)
+            .ok_or(anyhow::format_err!("key not found"))
             .and_then(|value| match value {
                 Value::Text(val) => Ok(val),
-                _ => Err(ServiceError::InvalidValueType),
+                _ => Err(anyhow::format_err!("invalid type")),
             });
 
         if res.is_err() {
@@ -416,11 +435,7 @@ impl Efis {
         let res = self
             .store
             .store()
-            .expire(req.key.as_str(), Duration::from_secs(req.duration))
-            .map_err(|err| match err {
-                DatastoreError::KeyNotFound => ServiceError::KeyNotFound,
-                _ => ServiceError::ErrorWrite,
-            });
+            .expire(req.key.as_str(), Duration::from_secs(req.duration));
 
         if res.is_err() {
             Err(anyhow::anyhow!(res.unwrap_err()))
@@ -437,11 +452,6 @@ impl Efis {
             .store
             .store()
             .ttl(req.key.as_str())
-            .map_err(|err| match err {
-                DatastoreError::KeyNotFound => ServiceError::KeyNotFound,
-                DatastoreError::KeyExpired => ServiceError::KeyExpired,
-                _ => ServiceError::Other("unkown error".to_owned()),
-            })
             .and_then(|ttl| match ttl {
                 Some(duration) => Ok(duration.as_secs().to_string()),
                 None => Ok("-1".to_string()),
@@ -469,21 +479,15 @@ impl Efis {
 
     fn _lpush(&self, req: types::ListReq) -> anyhow::Result<OkRes> {
         let mut store = self.store.store();
-        store
-            .set(req.key.clone(), Value::List(VecDeque::new()), None)
-            .map_err(|_| ServiceError::ErrorWrite)?;
-        let res = store
-            .modify(req.key.as_str(), |list| {
-                if let Value::List(list_data) = list {
-                    for item in req.values.into_iter() {
-                        list_data.push_front(item.to_string());
-                    }
+        store.set(req.key.clone(), Value::List(VecDeque::new()), None)?;
+        let res = store.modify(req.key.as_str(), |list| {
+            if let Value::List(list_data) = list {
+                for item in req.values.into_iter() {
+                    list_data.push_front(item.to_string());
                 }
-            })
-            .map_err(|err| match err {
-                DatastoreError::KeyNotFound => ServiceError::KeyNotFound,
-                _ => ServiceError::ErrorWrite,
-            });
+            }
+            Ok(())
+        });
 
         if res.is_err() {
             Err(anyhow::anyhow!(res.unwrap_err()))
@@ -509,20 +513,14 @@ impl Efis {
 
     fn _rpush(&self, req: types::ListReq) -> anyhow::Result<types::OkRes> {
         let mut store = self.store.store();
-        store
-            .set(req.key.clone(), Value::List(VecDeque::new()), None)
-            .map_err(|_| ServiceError::ErrorWrite)?;
+        store.set(req.key.clone(), Value::List(VecDeque::new()), None)?;
         let value: Vec<String> = req.values.into_iter().map(|v| v.to_string()).collect();
-        let res = store
-            .modify(req.key.as_str(), |list| {
-                if let Value::List(list_data) = list {
-                    list_data.extend(value);
-                }
-            })
-            .map_err(|err| match err {
-                DatastoreError::KeyNotFound => ServiceError::KeyNotFound,
-                _ => ServiceError::ErrorWrite,
-            });
+        let res = store.modify(req.key.as_str(), |list| {
+            if let Value::List(list_data) = list {
+                list_data.extend(value);
+            }
+            Ok(())
+        });
 
         if res.is_err() {
             Err(anyhow::anyhow!(res.unwrap_err()))
@@ -547,20 +545,15 @@ impl Efis {
     }
 
     fn _lpop(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
-        let mut res = Err(ServiceError::ErrorWrite);
-        self.store
-            .store()
-            .modify(req.key.as_str(), |list| {
-                if let Value::List(list_data) = list {
-                    if let Some(value) = list_data.pop_front() {
-                        res = Ok(value);
-                    }
+        let mut res = Err(anyhow::format_err!("failed to pop value"));
+        self.store.store().modify(req.key.as_str(), |list| {
+            if let Value::List(list_data) = list {
+                if let Some(value) = list_data.pop_front() {
+                    res = Ok(value);
                 }
-            })
-            .map_err(|err| match err {
-                DatastoreError::KeyNotFound => ServiceError::KeyNotFound,
-                _ => ServiceError::ErrorWrite,
-            })?;
+            }
+            Ok(())
+        })?;
 
         if res.is_err() {
             Err(anyhow::anyhow!(res.unwrap_err()))
@@ -583,20 +576,15 @@ impl Efis {
     }
 
     fn _rpop(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
-        let mut res = Err(ServiceError::ErrorWrite);
-        self.store
-            .store()
-            .modify(req.key.as_str(), |list| {
-                if let Value::List(list_data) = list {
-                    if let Some(value) = list_data.pop_back() {
-                        res = Ok(value);
-                    }
+        let mut res = Err(anyhow::format_err!("failed to pop value"));
+        self.store.store().modify(req.key.as_str(), |list| {
+            if let Value::List(list_data) = list {
+                if let Some(value) = list_data.pop_back() {
+                    res = Ok(value);
                 }
-            })
-            .map_err(|err| match err {
-                DatastoreError::KeyNotFound => ServiceError::KeyNotFound,
-                _ => ServiceError::ErrorWrite,
-            })?;
+            }
+            Ok(())
+        })?;
 
         if res.is_err() {
             Err(anyhow::anyhow!(res.unwrap_err()))
@@ -620,20 +608,14 @@ impl Efis {
 
     fn _sadd(&self, req: types::ListReq) -> anyhow::Result<OkRes> {
         let mut store = self.store.store();
-        store
-            .set(req.key.clone(), Value::Set(HashSet::new()), None)
-            .map_err(|_| ServiceError::ErrorWrite)?;
+        store.set(req.key.clone(), Value::Set(HashSet::new()), None)?;
         let value: Vec<String> = req.values.into_iter().map(|v| v.to_string()).collect();
-        let res = store
-            .modify(req.key.as_str(), |set| {
-                if let Value::Set(set_data) = set {
-                    set_data.extend(value);
-                }
-            })
-            .map_err(|err| match err {
-                DatastoreError::KeyNotFound => ServiceError::KeyNotFound,
-                _ => ServiceError::ErrorWrite,
-            });
+        let res = store.modify(req.key.as_str(), |set| {
+            if let Value::Set(set_data) = set {
+                set_data.extend(value);
+            }
+            Ok(())
+        });
 
         if res.is_err() {
             Err(anyhow::anyhow!(res.unwrap_err()))
@@ -650,10 +632,10 @@ impl Efis {
             .store
             .store()
             .get(req.key.as_str())
-            .ok_or(ServiceError::KeyNotFound)
+            .ok_or(anyhow::format_err!("key not found"))
             .and_then(|value| match value {
                 Value::Set(set_data) => Ok(format!("{:?}", set_data)),
-                _ => Err(ServiceError::InvalidValueType),
+                _ => Err(anyhow::format_err!("invalid type: expected set")),
             });
 
         if res.is_err() {
@@ -678,19 +660,13 @@ impl Efis {
 
     fn _zadd(&self, req: types::MapReq) -> anyhow::Result<types::OkRes> {
         let mut store = self.store.store();
-        store
-            .set(req.key.clone(), Value::SortedSet(BTreeMap::new()), None)
-            .map_err(|_| ServiceError::ErrorWrite)?;
-        let res = store
-            .modify(req.key.as_str(), |zset| {
-                if let Value::SortedSet(zset_data) = zset {
-                    zset_data.insert(req.score, req.value);
-                }
-            })
-            .map_err(|err| match err {
-                DatastoreError::KeyNotFound => ServiceError::KeyNotFound,
-                _ => ServiceError::ErrorWrite,
-            });
+        store.set(req.key.clone(), Value::SortedSet(BTreeMap::new()), None)?;
+        let res = store.modify(req.key.as_str(), |zset| {
+            if let Value::SortedSet(zset_data) = zset {
+                zset_data.insert(req.score, req.value);
+            }
+            Ok(())
+        });
 
         if res.is_err() {
             Err(anyhow::anyhow!(res.unwrap_err()))
@@ -707,7 +683,7 @@ impl Efis {
             .store
             .store()
             .get(req.key.as_str())
-            .ok_or(ServiceError::KeyNotFound)
+            .ok_or(anyhow::format_err!("key not found"))
             .and_then(|value| match value {
                 Value::SortedSet(zset_data) => {
                     let zset_vec: Vec<(String, i64)> = zset_data
@@ -722,7 +698,7 @@ impl Efis {
                         zset_vec[range].iter().map(|(v, _)| v.clone()).collect();
                     Ok(range_values)
                 }
-                _ => Err(ServiceError::InvalidValueType),
+                _ => Err(anyhow::format_err!("invalid type: expected SortedMap")),
             });
 
         if res.is_err() {
@@ -748,7 +724,7 @@ impl Efis {
     fn _publish(&'static self, req: types::PubReq) -> anyhow::Result<OkRes> {
         let sent = self.pubsub.ps().publish(req.chan, req.value);
         if sent == 0 && self.cons.is_none() {
-            return Err(anyhow::anyhow!(ServiceError::ErrorPublish));
+            return Err(anyhow::anyhow!("failed to publish"));
         }
         Ok(types::OkRes {
             status: "ok".to_string(),
@@ -766,6 +742,100 @@ impl Efis {
         });
 
         Ok(rx)
+    }
+
+    #[rpc_func]
+    fn vset(&'static self, req: types::VSetReq) -> anyhow::Result<OkRes> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::VSet(req)).await {
+                LateRes::Ok(ok) => Ok(ok),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._vset(req)
+        }
+    }
+
+    fn _vset(&self, req: types::VSetReq) -> anyhow::Result<types::OkRes> {
+        if self.store.store().get(&req.key).is_none() {
+            self.store.store().set(
+                req.key.clone(),
+                Value::Vector(FlatIndex::new(req.vec.len())),
+                None,
+            )?;
+        }
+
+        let res = self.store.store().modify(req.key.as_str(), |value| {
+            if let Value::Vector(val) = value {
+                return val.insert(req.id, &req.vec);
+            }
+            Ok(())
+        });
+
+        if res.is_err() {
+            Err(anyhow::anyhow!(res.unwrap_err()))
+        } else {
+            Ok(OkRes {
+                status: "ok".to_string(),
+            })
+        }
+    }
+
+    #[rpc_func]
+    async fn vdel(&'static self, req: types::VDelReq) -> anyhow::Result<types::OkRes> {
+        if self.cons.is_some() {
+            match self.handle_consensus(Command::VDel(req)).await {
+                LateRes::Ok(ok) => Ok(ok),
+                LateRes::Err(err) => Err(anyhow::format_err!(err)),
+                _ => Err(anyhow::format_err!("internal error")),
+            }
+        } else {
+            self._vdel(req)
+        }
+    }
+
+    fn _vdel(&self, req: types::VDelReq) -> anyhow::Result<types::OkRes> {
+        let res = self
+            .store
+            .store()
+            .remove(req.key.as_str())
+            .map_err(|_| anyhow::format_err!("key not found: {}", req.key))
+            .map(|_| ());
+
+        if res.is_err() {
+            Err(anyhow::anyhow!(res.unwrap_err()))
+        } else {
+            Ok(OkRes {
+                status: "ok".to_string(),
+            })
+        }
+    }
+
+    #[rpc_func]
+    fn vsearch(&'static self, req: types::VSearchReq) -> anyhow::Result<VSearchRes> {
+        let res = self
+            .store
+            .store()
+            .get(req.key.as_str())
+            .ok_or(anyhow::format_err!("key not found"))
+            .and_then(|value| match value {
+                Value::Vector(index) => {
+                    let res = index
+                        .search(&req.query, req.k, cosine_sim)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                    Ok(res)
+                }
+                _ => Err(anyhow::format_err!("invalid type: expected vector")),
+            });
+
+        if res.is_err() {
+            Err(anyhow::anyhow!(res.unwrap_err()))
+        } else {
+            Ok(types::VSearchRes { ids: res.unwrap() })
+        }
     }
 }
 

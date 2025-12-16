@@ -5,7 +5,6 @@ use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tokio::time::{self, Duration};
 use tracing::{error, info, instrument, warn};
 
-use crate::errors::RpcError;
 use crate::rpc::dispatcher::{Dispatcher, MiddlewareFunc, RpcFunc, RpcStreamFunc};
 use crate::rpc::{ErrorRes, RpcStruct, Serialize};
 
@@ -173,7 +172,7 @@ impl Listener {
 
 impl Handler {
     #[instrument(skip(self))]
-    async fn run(&mut self) -> Result<(), RpcError> {
+    async fn run(&mut self) -> anyhow::Result<()> {
         while !self.shutdown.is_shutdown() {
             let mut buf = vec![0u8; BUFF_SIZE];
             let n = tokio::select! {

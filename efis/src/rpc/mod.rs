@@ -67,6 +67,17 @@ impl Deserialize for f64 {
     }
 }
 
+impl Serialize for f32 {
+    fn serialize(&self) -> String {
+        self.to_string()
+    }
+}
+impl Deserialize for f32 {
+    fn deserialize(s: &str) -> Result<Self, String> {
+        s.parse().map_err(|e| format!("Failed to parse f32: {}", e))
+    }
+}
+
 impl Serialize for usize {
     fn serialize(&self) -> String {
         self.to_string()

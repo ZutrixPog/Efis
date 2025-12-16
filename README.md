@@ -3,8 +3,6 @@ Efis is a lightweight, educational distributed key-value store written in Rust. 
 
 Efis is intentionally minimal: it is **not intended for production use**, but rather as a platform to study consensus algorithms, distributed storage, serialization, and server design. Read the code, hack on it, break it, fix it — that’s the point.
 
----
-
 ## Features
 
 ### **Distributed Consensus (Raft)**
@@ -20,8 +18,6 @@ Efis now runs as a **cluster** using the Raft consensus algorithm:
 
 All writes go through the Raft log and are replicated to the cluster before becoming visible.
 
----
-
 ### **Replicated Key-Value Store**
 
 Efis supports string, list, set, and sorted-set data types which are:
@@ -32,8 +28,6 @@ Efis supports string, list, set, and sorted-set data types which are:
 
 This means every node agrees on the exact same state.
 
----
-
 ### **Durable Pub/Sub Through Raft**
 
 Pub/Sub is backed by the Raft log:
@@ -42,8 +36,6 @@ Pub/Sub is backed by the Raft log:
 * Subscribers on any node see the same sequence
 * Delivery is consistent cluster-wide
 * Subscriptions are kept open over the same TCP connection
-
----
 
 ### **Custom Human-Readable RPC Protocol**
 
@@ -54,8 +46,6 @@ Efis implements a simple TCP-based RPC protocol:
 * Each Raft message and client command is encoded as a structured text packet
 * Very easy to port to other languages (great learning exercise)
 
----
-
 ### **Automatic Persistent Backups**
 
 Efis periodically snapshots its in-memory database to disk:
@@ -63,8 +53,6 @@ Efis periodically snapshots its in-memory database to disk:
 * Configurable backup interval
 * Restores state on startup
 * Provides crash recovery even for single-node runs
-
----
 
 ## Commands
 
@@ -107,8 +95,6 @@ Efis speaks a simple RPC command set over TCP:
 
 Cluster management is handled internally by Raft through Efis’ custom RPC protocol.
 
----
-
 ## How to Build
 
 Requires Rust:
@@ -129,8 +115,6 @@ Or with Cargo:
 ```
 cargo build --release
 ```
-
----
 
 ## How to Run
 
@@ -157,8 +141,6 @@ and start issuing commands.
 
 To run a Raft cluster, simply start multiple Efis instances with different ports and cluster configurations.
 
----
-
 ## Docker Usage
 
 ### Build the image:
@@ -178,8 +160,6 @@ docker run \
     -p YOUR_PORT:YOUR_PORT \
     erfansafari/efis
 ```
-
----
 
 ## Contributions
 
