@@ -4,14 +4,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
-use super::RpcStruct;
+use super::{RpcError, RpcStruct};
 
-pub type RpcFunc = dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>
+pub type RpcFunc = dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, RpcError>> + Send>>
     + Send
     + Sync
     + 'static;
 
-pub type RpcStreamFunc = dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<mpsc::Receiver<String>>> + Send>>
+pub type RpcStreamFunc = dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<mpsc::Receiver<String>, RpcError>> + Send>>
     + Send
     + Sync
     + 'static;
@@ -49,7 +49,7 @@ impl Dispatcher {
         self.middlewares.push(middle);
     }
 
-    pub async fn dispatch_rpc(&self, req: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub async fn dispatch_rpc(&self, req: &[u8]) -> Result<Vec<u8>, RpcError> {
         let req_str = String::from_utf8_lossy(req);
         let mut parts = req_str.split(" ").collect::<Vec<&str>>();
         let method = parts.remove(0).trim();
@@ -61,14 +61,14 @@ impl Dispatcher {
         let rpc_fn = self
             .rpcs
             .get(method)
-            .ok_or_else(|| anyhow::anyhow!("Method not found"))?;
+            .ok_or_else(|| RpcError::MethodNotFound(method.to_string()))?;
 
-        let response = rpc_fn(parts.join(" ")).await? + "\n";
+        let response = rpc_fn(parts.join(" ")).await?;
 
         Ok(response.into_bytes())
     }
 
-    pub async fn dispatch_stream(&self, req: &[u8]) -> anyhow::Result<mpsc::Receiver<String>> {
+    pub async fn dispatch_stream(&self, req: &[u8]) -> Result<mpsc::Receiver<String>, RpcError> {
         let req_str = String::from_utf8_lossy(req);
         let mut parts = req_str.split(" ").collect::<Vec<&str>>();
         let method = parts.remove(0).trim();
@@ -80,7 +80,7 @@ impl Dispatcher {
         let stream_fn = self
             .streams
             .get(method)
-            .ok_or_else(|| anyhow::anyhow!("Method not found"))?;
+            .ok_or_else(|| RpcError::MethodNotFound(method.to_string()))?;
 
         let response = stream_fn(parts.join(" ")).await?;
 
@@ -91,10 +91,10 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::RpcError;
     use crate::rpc::{Deserialize, Serialize};
     use macros::{rpc_func, rpc_impl, rpc_stream, rpc_struct, SerDe};
-    use std::mem::MaybeUninit;
-    use std::sync::Once;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
     #[derive(SerDe, Debug, PartialEq, Default, Clone)]
@@ -113,29 +113,27 @@ mod tests {
     #[rpc_struct]
     struct Test {}
 
+    static INSTANCE: OnceLock<&'static Test> = OnceLock::new();
+
     #[rpc_impl]
     impl Test {
         pub fn singleton(t: Self) -> &'static Self {
-            static mut SINGLETON: MaybeUninit<Test> = MaybeUninit::uninit();
-            static ONCE: Once = Once::new();
-
-            unsafe {
-                ONCE.call_once(|| {
-                    let singleton = t;
-                    SINGLETON.write(singleton);
-                });
-
-                SINGLETON.assume_init_ref()
-            }
+            INSTANCE.get_or_init(|| {
+                let boxed = Box::new(t);
+                Box::leak(boxed)
+            })
         }
 
         #[rpc_func]
-        pub async fn rpc_fn(&'static self, req: Req) -> anyhow::Result<Res> {
+        pub async fn rpc_fn(&'static self, req: Req) -> Result<Res, RpcError> {
             Ok(Res { a: 12 })
         }
 
         #[rpc_stream]
-        pub async fn rpc_stream_fn(&'static self, req: Req) -> anyhow::Result<mpsc::Receiver<Res>> {
+        pub async fn rpc_stream_fn(
+            &'static self,
+            req: Req,
+        ) -> Result<mpsc::Receiver<Res>, RpcError> {
             let (tx, rx) = mpsc::channel(10);
             tokio::spawn(async move {
                 for i in 0..req.a {
@@ -149,7 +147,7 @@ mod tests {
     }
 
     #[rpc_func]
-    async fn rpc_test_fn(req: Req) -> anyhow::Result<Res> {
+    async fn rpc_test_fn(req: Req) -> Result<Res, RpcError> {
         Ok(Res { a: 12 })
     }
 
@@ -172,7 +170,7 @@ mod tests {
         assert!(res.is_ok());
 
         let res_str = String::from_utf8(res.unwrap()).unwrap();
-        assert!(res_str == "{a=12}\n".to_owned());
+        assert_eq!(res_str, "{a=12}".to_owned());
 
         let res = dis
             .read()
@@ -180,7 +178,10 @@ mod tests {
             .dispatch_rpc("rpc_fn {a=123 b=32.3 c=hey d=[1,2]}".as_bytes())
             .await;
         assert!(res.is_ok());
-        assert!(String::from_utf8(res.unwrap()).unwrap() == "{a=12}\n".to_owned());
+        assert_eq!(
+            String::from_utf8(res.unwrap()).unwrap(),
+            "{a=12}".to_owned()
+        );
 
         let mut res_chan = dis
             .read()

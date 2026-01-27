@@ -160,15 +160,15 @@ pub fn rpc_func(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let output_type = match &input.sig.output {
         ReturnType::Type(_, ty) => ty,
-        _ => panic!("Expected a return type of `anyhow::Result<Res>`"),
+        _ => panic!("Expected a return type of `Result<Res, RpcError>`"),
     };
 
     let output = if let Some(self_arg) = self_arg {
         quote! {
-            fn #fn_name(#self_arg, req: String) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<String>> + Send>> {
+            fn #fn_name(#self_arg, req: String) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Result<String, RpcError>> + Send>> {
                 Box::pin(async move {
                     let req = #req_type::deserialize(req.as_str())
-                        .map_err(|e| ::anyhow::anyhow!("Failed to deserialize request: {}", e))?;
+                        .map_err(|e| RpcError::Deserialize(e))?;
 
                     let result: #output_type = #fn_body;
 
@@ -178,10 +178,10 @@ pub fn rpc_func(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {
-            fn #fn_name(req: String) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<String>> + Send>> {
+            fn #fn_name(req: String) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Result<String, RpcError>> + Send>> {
                 Box::pin(async move {
                     let req = #req_type::deserialize(req.as_str())
-                        .map_err(|e| ::anyhow::anyhow!("Failed to deserialize request: {}", e))?;
+                        .map_err(|e| RpcError::Deserialize(e))?;
 
                     let result: #output_type = #fn_body;
 
@@ -233,17 +233,17 @@ pub fn rpc_stream(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let output_type = match &input.sig.output {
         ReturnType::Type(_, ty) => ty,
-        _ => panic!("Expected a return type of `anyhow::Result<mpsc::Receiver<Res>>`"),
+        _ => panic!("Expected a return type of `Result<mpsc::Receiver<Res>, RpcError>`"),
     };
 
     let output = if let Some(self_arg) = self_arg {
         quote! {
             fn #fn_name(#self_arg, req: String)
-                -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<::tokio::sync::mpsc::Receiver<String>>> + Send>>
+                -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Result<::tokio::sync::mpsc::Receiver<String>, RpcError>> + Send>>
             {
                 Box::pin(async move {
                      let req = #req_type::deserialize(req.as_str())
-                        .map_err(|e| ::anyhow::anyhow!("Failed to deserialize request: {}", e))?;
+                        .map_err(|e| RpcError::Deserialize(e))?;
 
                     let result: #output_type = #fn_body;
                     result.map(|rx| {
@@ -251,9 +251,9 @@ pub fn rpc_stream(_attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::tokio::spawn(async move {
                             let mut rx = rx;
                             while let Some(item) = rx.recv().await {
-                                let _ = tx2.send(item.serialize() + "\n").await;
+                                let _ = tx2.send(item.serialize()).await;
                             }
-                            let _ = tx2.send("done\n".to_string()).await;
+                            let _ = tx2.send("done".to_string()).await;
                             drop(tx2);
                         });
                         rx2
@@ -264,11 +264,11 @@ pub fn rpc_stream(_attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {
             fn #fn_name(req: String)
-                -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ::anyhow::Result<::tokio::sync::mpsc::Receiver<String>>> + Send>>
+                -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Result<::tokio::sync::mpsc::Receiver<String>, RpcError>> + Send>>
             {
                 Box::pin(async move {
                     let req = #req_type::deserialize(req.as_str())
-                        .map_err(|e| ::anyhow::anyhow!("Failed to deserialize request: {}", e))?;
+                        .map_err(|e| RpcError::Deserialize(e))?;
 
                     let result: #output_type = #fn_body;
                     result.map(|rx| {
@@ -276,9 +276,9 @@ pub fn rpc_stream(_attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::tokio::spawn(async move {
                             let mut rx = rx;
                             while let Some(item) = rx.recv().await {
-                                let _ = tx2.send(item.serialize() + "\n").await;
+                                let _ = tx2.send(item.serialize()).await;
                             }
-                            let _ = tx2.send("done\n".to_string()).await;
+                            let _ = tx2.send("done".to_string()).await;
                             drop(tx2);
                         });
                         rx2

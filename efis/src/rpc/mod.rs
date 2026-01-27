@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use thiserror::Error;
 
 pub mod client;
 pub mod dispatcher;
@@ -23,6 +24,18 @@ where
     fn as_any(&self) -> Arc<dyn std::any::Any> {
         Arc::new(self.clone())
     }
+}
+
+#[derive(Error, Debug)]
+pub enum RpcError {
+    #[error("method not found: {0}")]
+    MethodNotFound(String),
+
+    #[error("failed to deserialize: {0}")]
+    Deserialize(String),
+
+    #[error("handler failed: {0}")]
+    Internal(#[from] anyhow::Error),
 }
 
 #[derive(macros::SerDe)]
@@ -86,7 +99,7 @@ impl Serialize for usize {
 impl Deserialize for usize {
     fn deserialize(s: &str) -> Result<Self, String> {
         s.parse()
-            .map_err(|e| format!("Faield to parse usize: {}", e))
+            .map_err(|e| format!("Faield to parse usize: {} {}", e, s))
     }
 }
 
@@ -143,7 +156,7 @@ impl<T: Serialize + Clone> Serialize for Option<T> {
 }
 impl<T: Deserialize> Deserialize for Option<T> {
     fn deserialize(s: &str) -> Result<Self, String> {
-        if s.contains("None") {
+        if s.contains("None") || s.is_empty() {
             return Ok(None);
         }
         Ok(Some(T::deserialize(s).unwrap()))

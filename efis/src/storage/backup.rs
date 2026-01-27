@@ -47,21 +47,6 @@ impl FileBackupRepo {
     }
 
     pub async fn retrieve(&self) -> anyhow::Result<Vec<u8>> {
-        // let mut latest_file: Option<PathBuf> = None;
-        // let mut latest_modification_time = SystemTime::UNIX_EPOCH;
-
-        // let mut entries = fs::read_dir(&self.path).await.map_err(|_| PersistError::ErrorRead)?;
-        // while let Some(entry) = entries.next_entry().await.map_err(|_| PersistError::ErrorRead)? {
-        //     if let Ok(metadata) = entry.metadata().await {
-        //         let modified_time = metadata.created().unwrap_or(UNIX_EPOCH);
-
-        //         if modified_time > latest_modification_time {
-        //             latest_file = Some(entry.path());
-        //             latest_modification_time = modified_time;
-        //         }
-        //     }
-        // }
-
         let file_path = self.path.join(FILE_NAME);
         let mut file = File::open(&file_path)
             .await

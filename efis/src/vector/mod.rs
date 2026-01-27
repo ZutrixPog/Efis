@@ -7,12 +7,15 @@ pub mod flat;
 type Vector<'a> = &'a [f32];
 
 pub trait Index {
-    fn insert(&mut self, id: String, v: Vector) -> anyhow::Result<()>;
-    fn search(&self, query: Vector, k: usize, df: DistanceFn) -> Vec<(String, f32)>;
-    fn delete(&mut self, id: String);
+    fn insert(&mut self, id: u64, v: Vector) -> anyhow::Result<()>;
+    fn search(&self, query: Vector, k: usize, df: Distance) -> Vec<(u64, f32)>;
+    fn delete(&mut self, id: u64);
 }
 
-pub type DistanceFn = fn(Vector, Vector) -> f32;
+pub enum Distance {
+    L2,
+    Cosine,
+}
 
 #[derive(PartialEq)]
 struct F32(f32);

@@ -19,7 +19,7 @@ run1: build
     PORT=3333 \
     PERSIST_PATH={{persist_path}}1 \
     PERSIST_INTERVAL={{persist_interval}} \
-    PEERS=localhost:3334,localhost:3335,localhost:3336 \
+    PEERS=localhost:3334,localhost:3335 \
     ./target/release/efis
 
 run2: build
@@ -27,7 +27,7 @@ run2: build
     PORT=3334 \
     PERSIST_PATH={{persist_path}}2 \
     PERSIST_INTERVAL={{persist_interval}} \
-    PEERS=localhost:3333,localhost:3335,localhost:3336 \
+    PEERS=localhost:3333,localhost:3335 \
     ./target/release/efis
 
 run3: build
@@ -35,7 +35,7 @@ run3: build
     PORT=3335 \
     PERSIST_PATH={{persist_path}}3 \
     PERSIST_INTERVAL={{persist_interval}} \
-    PEERS=localhost:3333,localhost:3334,localhost:3336 \
+    PEERS=localhost:3333,localhost:3334 \
     ./target/release/efis
 
 run4: build

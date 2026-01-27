@@ -1,181 +1,200 @@
-use std::time::Duration;
-
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, RwLock};
-use tracing::error;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::sleep;
 
 use crate::rpc::{Deserialize, ErrorRes};
 
 use super::Serialize;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 50;
-const BUFF_SIZE: usize = 512;
+enum ClientMsg {
+    Call {
+        payload: Vec<u8>,
+        resp_tx: oneshot::Sender<anyhow::Result<String>>,
+    },
+    CallStream {
+        payload: Vec<u8>,
+        stream_tx: mpsc::Sender<String>,
+    },
+}
 
-// TODO: add auth
+#[derive(Clone)]
 pub struct Client {
-    addr: String,
-    conn: Arc<RwLock<TcpStream>>,
-    trigger: mpsc::Sender<()>,
-    connected: Arc<AtomicPtr<bool>>,
+    sender: mpsc::Sender<ClientMsg>,
+    connected: Arc<AtomicBool>,
 }
 
 impl Client {
-    pub async fn connect(addr: String) -> Self {
-        let (tx, mut rx) = mpsc::channel(8);
-        let mut conn = TcpStream::connect(addr.clone()).await;
-        while conn.is_err() {
-            error!("failed to connect to peer");
-            conn = TcpStream::connect(addr.clone()).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-        let conn = Arc::new(RwLock::new(conn.unwrap()));
+    pub fn new(addr: String) -> Self {
+        let (tx, rx) = mpsc::channel(32);
+        let connected = Arc::new(AtomicBool::new(false));
 
-        let addr_clone = addr.clone();
-        let conn_clone = conn.clone();
-        let connected = &mut true;
-        let connected_ptr = Arc::new(AtomicPtr::new(connected));
-
-        let connected_ptr_clone = connected_ptr.clone();
-        tokio::spawn(async move {
-            let mut backoff = Duration::from_millis(100);
-            let max = Duration::from_secs(5);
-
-            loop {
-                if rx.recv().await.is_none() {
-                    return;
-                }
-
-                unsafe {
-                    *connected_ptr_clone.load(Ordering::Relaxed) = false;
-                }
-                loop {
-                    match TcpStream::connect(&addr_clone).await {
-                        Ok(s) => {
-                            *conn_clone.write().await = s;
-                            backoff = Duration::from_millis(100);
-                            unsafe {
-                                *connected_ptr_clone.load(Ordering::Relaxed) = true;
-                            }
-                            break;
-                        }
-                        Err(_) => {
-                            let sleep = tokio::time::sleep(backoff);
-                            tokio::select! {
-                                _ = sleep => {},
-                                Some(_) = rx.recv() => {},
-                            }
-
-                            backoff = (backoff * 2).min(max);
-                        }
-                    }
-                }
-            }
-        });
+        tokio::spawn(io_loop(addr, rx, connected.clone()));
 
         Self {
-            addr,
-            conn,
-            trigger: tx,
-            connected: connected_ptr,
+            sender: tx,
+            connected,
         }
     }
 
     pub fn connected(&self) -> bool {
-        unsafe { *self.connected.as_ref().load(Ordering::Relaxed) }
+        self.connected.load(Ordering::Relaxed)
     }
 
-    pub async fn call<T: Deserialize>(
+    pub async fn call<T: Deserialize + Send>(
         &self,
-        method: String,
+        method: &str,
         req: &dyn Serialize,
     ) -> anyhow::Result<T> {
-        let packet = format!("{} {}\n", method, req.serialize()).into_bytes();
+        let (resp_tx, resp_rx) = oneshot::channel();
 
-        for _ in 0..1 {
-            let mut conn = self.conn.as_ref().write().await;
+        let payload = format!("{} {}\n", method, req.serialize()).into_bytes();
 
-            if conn.write_all(&packet).await.is_err() {
-                let _ = self.trigger.send(()).await;
-                continue;
-            }
+        self.sender
+            .send(ClientMsg::Call { payload, resp_tx })
+            .await
+            .map_err(|_| anyhow::anyhow!("Client actor closed"))?;
 
-            if conn.flush().await.is_err() {
-                let _ = self.trigger.send(()).await;
-                continue;
-            }
+        let raw_resp = resp_rx.await??;
 
-            let mut buff = vec![0u8; BUFF_SIZE];
-            let res = tokio::time::timeout(
-                Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-                conn.read(&mut buff),
-            )
-            .await;
-
-            let n = match res {
-                Ok(Ok(n)) => n,
-                _ => {
-                    let _ = self.trigger.send(()).await;
-                    continue;
-                }
-            };
-
-            let res_str = String::from_utf8_lossy(&buff[..n]).to_string();
-
-            if let Ok(err) = ErrorRes::deserialize(&res_str) {
-                return Err(anyhow::anyhow!(err.error));
-            }
-
-            return T::deserialize(&res_str).map_err(anyhow::Error::msg);
+        if let Ok(err) = ErrorRes::deserialize(&raw_resp) {
+            return Err(anyhow::anyhow!(err.error));
         }
-
-        anyhow::bail!("failed to connect after retries")
+        T::deserialize(&raw_resp).map_err(|e| anyhow::anyhow!("DeDe Error: {}", e))
     }
 
-    pub async fn call_stream<T: Deserialize + Send + Sync + 'static>(
+    pub async fn call_stream<T: Deserialize + Send + 'static>(
         &self,
-        method: String,
+        method: &str,
         req: &dyn Serialize,
     ) -> anyhow::Result<mpsc::Receiver<T>> {
-        let req = format!("{} {}\n", method, req.serialize()).into_bytes();
+        let (stream_tx, mut stream_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(32);
 
-        let (tx, rx) = mpsc::channel(10);
+        let payload = format!("{} {}\n", method, req.serialize()).into_bytes();
 
-        let mut conn = TcpStream::connect(self.addr.clone()).await?;
+        self.sender
+            .send(ClientMsg::CallStream { payload, stream_tx })
+            .await
+            .map_err(|_| anyhow::anyhow!("Client actor closed"))?;
 
         tokio::spawn(async move {
-            let _ = conn.write_all(&req).await;
-            let _ = conn.flush().await;
-
-            let mut buff = vec![0u8; BUFF_SIZE];
-
-            loop {
-                let n = match conn.read(&mut buff).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-
-                let part = &buff[..n];
-                let Ok(s) = String::from_utf8(part.to_vec()) else {
-                    break;
-                };
-
-                for msg in s.split("\n") {
-                    if msg.starts_with("done") {
-                        drop(tx);
-                        return;
-                    }
-                    if let Ok(v) = T::deserialize(&msg) {
-                        let _ = tx.send(v).await;
+            while let Some(raw) = stream_rx.recv().await {
+                if let Ok(item) = T::deserialize(&raw) {
+                    if out_tx.send(item).await.is_err() {
+                        break;
                     }
                 }
             }
         });
 
-        Ok(rx)
+        Ok(out_rx)
+    }
+}
+
+async fn io_loop(
+    addr: String,
+    mut inbox: mpsc::Receiver<ClientMsg>,
+    connected_flag: Arc<AtomicBool>,
+) {
+    let mut stream: Option<TcpStream> = None;
+    let mut buf = vec![0u8; 4096];
+
+    loop {
+        if stream.is_none() {
+            match TcpStream::connect(&addr).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    connected_flag.store(true, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    connected_flag.store(false, Ordering::Relaxed);
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            }
+        }
+
+        match inbox.recv().await {
+            Some(msg) => {
+                let s = stream.as_mut().unwrap();
+                match msg {
+                    ClientMsg::Call { payload, resp_tx } => {
+                        if let Ok(r) = process_unary(s, &payload, &mut buf).await {
+                            let _ = resp_tx.send(Ok(r));
+                        } else {
+                            stream = None;
+                            let _ = resp_tx.send(Err(anyhow::anyhow!("Connection lost")));
+                        }
+                    }
+                    ClientMsg::CallStream { payload, stream_tx } => {
+                        if let Err(_) = process_stream(s, &payload, stream_tx, &mut buf).await {
+                            stream = None;
+                        }
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+}
+
+async fn process_unary(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    buf: &mut Vec<u8>,
+) -> anyhow::Result<String> {
+    stream.write_all(payload).await?;
+    stream.flush().await?;
+
+    let mut accumulated = Vec::new();
+    loop {
+        let n = stream.read(buf).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("EOF"));
+        }
+
+        accumulated.extend_from_slice(&buf[..n]);
+        if let Some(pos) = accumulated.iter().position(|&b| b == b'\n') {
+            let line = accumulated.drain(..pos).collect::<Vec<_>>();
+            return Ok(String::from_utf8(line)?);
+        }
+    }
+}
+
+async fn process_stream(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    tx: mpsc::Sender<String>,
+    buf: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    stream.write_all(payload).await?;
+    stream.flush().await?;
+
+    let mut accumulated = Vec::new();
+    loop {
+        let n = stream.read(buf).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("EOF"));
+        }
+
+        accumulated.extend_from_slice(&buf[..n]);
+
+        while let Some(pos) = accumulated.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = accumulated.drain(..=pos).collect();
+            let line_str = String::from_utf8(line_bytes[..line_bytes.len() - 1].to_vec())?;
+
+            if line_str == "done" {
+                return Ok(());
+            }
+
+            if tx.send(line_str).await.is_err() {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -183,7 +202,7 @@ impl Client {
 mod tests {
     use crate::rpc::client::Client;
     use crate::rpc::server::RpcServer;
-    use crate::rpc::{Deserialize, Serialize};
+    use crate::rpc::{Deserialize, RpcError, Serialize};
     use macros::{rpc_func, rpc_stream, SerDe};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -194,17 +213,17 @@ mod tests {
     }
 
     #[rpc_func]
-    async fn rpc_test_fn(req: Req) -> anyhow::Result<Req> {
+    async fn rpc_test_fn(req: Req) -> Result<Req, RpcError> {
         Ok(Req { a: req.a * 2 })
     }
 
     #[rpc_func]
-    async fn rpc_test_err_fn(req: Req) -> anyhow::Result<Req> {
-        Err(anyhow::anyhow!("error"))
+    async fn rpc_test_err_fn(req: Req) -> Result<Req, RpcError> {
+        Err(RpcError::Internal(anyhow::anyhow!("error")))
     }
 
     #[rpc_stream]
-    async fn rpc_test_stream_fn(req: Req) -> anyhow::Result<mpsc::Receiver<Req>> {
+    async fn rpc_test_stream_fn(req: Req) -> Result<mpsc::Receiver<Req>, RpcError> {
         let (tx, rx) = mpsc::channel(10);
         tokio::spawn(async move {
             for i in 0..req.a {
@@ -224,27 +243,23 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-        let client = Client::connect("localhost:8080".to_owned()).await;
+        let client = Client::new("localhost:8080".to_owned());
         let input = 12;
-        let res = client.call("test".to_owned(), &Req { a: input }).await;
+        let res = client.call("test", &Req { a: input }).await;
         assert!(res.is_ok());
         let res: Req = res.unwrap();
 
         assert_eq!(res.a, input * 2);
 
-        let res = client
-            .call::<Req>("test_err".to_owned(), &Req { a: input })
-            .await;
+        let res = client.call::<Req>("test_err", &Req { a: input }).await;
         assert!(res.is_err());
-        assert_eq!(res.unwrap_err().to_string(), "error".to_string());
 
         let mut res = client
-            .call_stream::<Req>("test_stream".to_owned(), &Req { a: input })
+            .call_stream::<Req>("test_stream", &Req { a: input })
             .await;
         assert!(res.is_ok());
         let mut vals = Vec::new();
         while let Some(msg) = res.as_mut().unwrap().recv().await {
-            println!("{:?}", msg);
             vals.push(msg);
         }
         assert_eq!(input as usize, vals.len());

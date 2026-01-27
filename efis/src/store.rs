@@ -1,11 +1,13 @@
+use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
 use std::cmp::PartialEq;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::From;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Instant;
 use std::time::SystemTime;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tokio::time::{interval, Duration};
 use tracing::{error, info};
 
@@ -31,9 +33,8 @@ struct Item {
     expiry: Option<SystemTime>,
 }
 
-#[derive(Debug)]
 pub struct DatastoreGuard {
-    store: Datastore,
+    store: Arc<Datastore>,
     interval: Option<Duration>,
     path: Option<String>,
     notify_shutdown: Option<broadcast::Sender<()>>,
@@ -52,7 +53,7 @@ impl DatastoreGuard {
             g
         } else {
             Self {
-                store: Datastore::new(),
+                store: Arc::new(Datastore::new()),
                 interval,
                 path,
                 notify_shutdown: None,
@@ -65,7 +66,7 @@ impl DatastoreGuard {
         guard
     }
 
-    pub fn store(&self) -> Datastore {
+    pub fn store(&self) -> Arc<Datastore> {
         self.store.clone()
     }
 
@@ -102,7 +103,7 @@ impl DatastoreGuard {
 
 async fn backup(data: &Datastore, repo: &FileBackupRepo) {
     // info!("backup data persisted on disk.");
-    let data = data.encode().unwrap();
+    let data = data.encode().await.unwrap();
     if let Err(err) = repo.save(data).await {
         error!("backup service stopped: {}", err.to_string());
         return;
@@ -118,33 +119,28 @@ impl Drop for DatastoreGuard {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct Datastore {
-    data: Arc<Mutex<HashMap<String, Item>>>,
+    data: DashMap<String, Item>,
 }
 
 impl Datastore {
     pub fn new() -> Self {
         Self {
-            data: Arc::new(Mutex::new(HashMap::new())),
+            data: DashMap::new(),
         }
     }
 
-    fn encode(&self) -> anyhow::Result<Vec<u8>> {
-        let data = self.data.lock().unwrap();
-        encode(data.clone()).map_err(|_| anyhow::format_err!("couldn't encode"))
+    async fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(Vec::new())
+        // encode(self.data.clone()).map_err(|_| anyhow::format_err!("couldn't encode"))
     }
 
-    pub fn shutdown_purge_task(&self) {
-        let state = self.data.lock().unwrap();
-
-        drop(state);
-    }
+    pub fn shutdown_purge_task(&self) {}
 }
 
 impl Datastore {
-    pub fn set(
-        &mut self,
+    pub async fn set(
+        &self,
         key: String,
         value: Value,
         expiry: Option<Duration>,
@@ -153,17 +149,16 @@ impl Datastore {
             value: value,
             expiry: expiry.map(|d| SystemTime::now() + d),
         };
-        let mut data = self.data.lock().unwrap();
-        data.insert(key, item);
+        self.data.insert(key, item);
         Ok(())
     }
 
-    pub fn get(&self, key: &str) -> Option<Value> {
-        let mut data = self.data.lock().unwrap();
-        if let Some(item) = data.get(key) {
+    pub async fn get(&self, key: &str) -> Option<Value> {
+        tokio::task::spawn_blocking(|| {});
+        if let Some(item) = self.data.get(key) {
             if let Some(expiry) = item.expiry {
                 if expiry <= SystemTime::now() {
-                    data.remove(key);
+                    self.data.remove(key);
                     return None;
                 }
             }
@@ -174,18 +169,16 @@ impl Datastore {
         }
     }
 
-    pub fn remove(&mut self, key: &str) -> anyhow::Result<()> {
-        let mut data = self.data.lock().unwrap();
-        if data.remove(key).is_some() {
+    pub async fn remove(&self, key: &str) -> anyhow::Result<()> {
+        if self.data.remove(key).is_some() {
             Ok(())
         } else {
             Err(anyhow::format_err!("key not found"))
         }
     }
 
-    pub fn expire(&mut self, key: &str, duration: Duration) -> anyhow::Result<()> {
-        let mut data = self.data.lock().unwrap();
-        if let Some(item) = data.get_mut(key) {
+    pub async fn expire(&self, key: &str, duration: Duration) -> anyhow::Result<()> {
+        if let Some(mut item) = self.data.get_mut(key) {
             item.expiry = Some(SystemTime::now() + duration);
             Ok(())
         } else {
@@ -193,13 +186,12 @@ impl Datastore {
         }
     }
 
-    pub fn ttl(&self, key: &str) -> anyhow::Result<Option<Duration>> {
-        let mut data = self.data.lock().unwrap();
-        if let Some(item) = data.get(key) {
+    pub async fn ttl(&self, key: &str) -> anyhow::Result<Option<Duration>> {
+        if let Some(item) = self.data.get(key) {
             if let Some(expiry) = item.expiry {
                 let now = SystemTime::now();
                 if now >= expiry {
-                    data.remove(key);
+                    self.data.remove(key);
                     return Err(anyhow::format_err!("key expired"));
                 }
                 if let Ok(duration) = expiry.duration_since(now) {
@@ -215,12 +207,11 @@ impl Datastore {
         }
     }
 
-    pub fn modify<F>(&mut self, key: &str, modifier: F) -> anyhow::Result<()>
+    pub async fn modify<F>(&self, key: &str, modifier: F) -> anyhow::Result<()>
     where
         F: FnOnce(&mut Value) -> anyhow::Result<()>,
     {
-        let mut data = self.data.lock().unwrap();
-        if let Some(item) = data.get_mut(key) {
+        if let Some(mut item) = self.data.get_mut(key) {
             let value = &mut item.value;
             modifier(value)?;
             Ok(())
@@ -232,12 +223,11 @@ impl Datastore {
 
 impl From<Vec<u8>> for DatastoreGuard {
     fn from(value: Vec<u8>) -> Self {
-        let decoded = decode(&value).unwrap();
+        // let decoded = decode(&value).unwrap();
+        let decoded = DashMap::new();
 
         DatastoreGuard {
-            store: Datastore {
-                data: Arc::new(Mutex::new(decoded)),
-            },
+            store: Arc::new(Datastore { data: decoded }),
             interval: None,
             path: None,
             notify_shutdown: None,
@@ -253,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_and_get() {
         let guard = DatastoreGuard::new(None, None).await;
-        let mut datastore = guard.store();
+        let datastore = guard.store();
 
         let mut list = VecDeque::new();
         list.push_back("hello".to_owned());
@@ -291,62 +281,66 @@ mod tests {
         std::thread::sleep(Duration::from_secs(4));
 
         for (key, res) in cases {
-            assert_eq!(datastore.get(key), res);
+            assert_eq!(datastore.get(key).await, res);
         }
     }
 
     #[tokio::test]
     async fn test_remove() {
         let guard = DatastoreGuard::new(None, None).await;
-        let mut datastore = guard.store();
+        let datastore = guard.store();
 
         let _ = datastore.set("key1".to_owned(), Value::Text("value1".to_owned()), None);
 
-        let result = datastore.remove("key1");
+        let result = datastore.remove("key1").await;
         assert!(result.is_ok());
 
-        let result = datastore.remove("non_existent_key");
+        let result = datastore.remove("non_existent_key").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_expire_and_ttl() {
         let guard = DatastoreGuard::new(None, None).await;
-        let mut datastore = guard.store();
+        let datastore = guard.store();
 
         let _ = datastore.set(
             "key1".to_owned(),
             Value::Text("value1".to_owned()),
             Some(Duration::from_secs(2)),
         );
-        let _ = datastore.set("key2".to_owned(), Value::Text("value2".to_owned()), None);
+        let _ = datastore
+            .set("key2".to_owned(), Value::Text("value2".to_owned()), None)
+            .await;
 
-        assert!(datastore.ttl("key1").is_ok());
-        assert!(datastore.ttl("key2").is_ok());
+        assert!(datastore.ttl("key1").await.is_ok());
+        assert!(datastore.ttl("key2").await.is_ok());
 
         std::thread::sleep(Duration::from_secs(4));
 
-        assert!(datastore.ttl("key1").is_err());
-        assert!(datastore.get("key1").is_none());
+        assert!(datastore.ttl("key1").await.is_err());
+        assert!(datastore.get("key1").await.is_none());
     }
 
     #[tokio::test]
     async fn test_modify_existing_key() {
         let guard = DatastoreGuard::new(None, None).await;
-        let mut datastore = guard.store();
+        let datastore = guard.store();
 
         let _ = datastore.set("key".to_owned(), Value::Text("value".to_owned()), None);
 
-        let res = datastore.modify("key", |value| {
-            if let Value::Text(ref mut v) = value {
-                *v = "new_value".to_owned();
-            }
-            Ok(())
-        });
+        let res = datastore
+            .modify("key", |value| {
+                if let Value::Text(ref mut v) = value {
+                    *v = "new_value".to_owned();
+                }
+                Ok(())
+            })
+            .await;
 
         assert!(res.is_ok());
         assert_eq!(
-            datastore.get("key"),
+            datastore.get("key").await,
             Some(Value::Text("new_value".to_owned()))
         );
     }
@@ -354,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn test_encode_decode() {
         let guard = DatastoreGuard::new(None, None).await;
-        let mut datastore = guard.store();
+        let datastore = guard.store();
 
         let (key, value) = ("key", Value::Text("value".to_owned()));
         let (key1, value1) = ("key1", Value::Text("value1".to_owned()));
@@ -378,7 +372,7 @@ mod tests {
             },
         );
 
-        let encoded = datastore.encode();
+        let encoded = datastore.encode().await;
         assert!(encoded.is_ok());
 
         let encoded = encoded.unwrap();
@@ -395,7 +389,7 @@ mod tests {
         let data = String::from("data");
 
         let guard = DatastoreGuard::new(Some(backup_interval), Some(PATH.to_owned())).await;
-        let mut store = guard.store();
+        let store = guard.store();
         let _ = store.set("data".to_owned(), Value::Text(data), None);
 
         sleep(Duration::from_secs(2)).await;

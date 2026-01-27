@@ -47,7 +47,7 @@ async fn run_rpc(cfg: Config) {
             }
         }
         let con_path = cfg.persist_path.unwrap();
-        let con_storage = ConFileStorage::new(PathBuf::from_str(&con_path).unwrap());
+        let con_storage = ConFileStorage::new(PathBuf::from_str(&con_path).unwrap()).await;
 
         let (mut cons, crpc) = Consensus::new(cfg.id.unwrap(), con_storage).await;
         tokio::spawn(async move {

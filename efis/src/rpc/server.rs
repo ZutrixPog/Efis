@@ -1,8 +1,11 @@
+use super::RpcError;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufWriter;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tokio::time::{self, Duration};
+use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{error, info, instrument, warn};
 
 use crate::rpc::dispatcher::{Dispatcher, MiddlewareFunc, RpcFunc, RpcStreamFunc};
@@ -98,7 +101,6 @@ impl RpcServer {
                 match rx.recv().await {
                     Ok(msg) => {
                         let buf = msg.as_bytes();
-                        println!("{:?}", msg);
 
                         let reader = dispatcher.read().await;
                         if let Err(err) = reader.dispatch_rpc(buf).await {
@@ -135,7 +137,7 @@ impl Listener {
 
             let socket = self.accept().await?;
 
-            let mut handler = Handler {
+            let handler = Handler {
                 socket,
                 dispatcher: Arc::clone(&self.dispatcher),
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
@@ -170,65 +172,84 @@ impl Listener {
     }
 }
 
+use futures::StreamExt;
+
 impl Handler {
     #[instrument(skip(self))]
-    async fn run(&mut self) -> anyhow::Result<()> {
-        while !self.shutdown.is_shutdown() {
-            let mut buf = vec![0u8; BUFF_SIZE];
-            let n = tokio::select! {
-                n = self.socket.read(&mut buf) => n.unwrap_or(0),
+    async fn run(mut self: Self) -> anyhow::Result<()> {
+        let (read_half, write_half) = tokio::io::split(self.socket);
+        let mut reader = FramedRead::new(read_half, LinesCodec::new());
+        let mut writer = BufWriter::new(write_half);
+
+        loop {
+            tokio::select! {
                 _ = self.shutdown.recv() => {
                     return Ok(());
                 }
-            };
-            buf = buf[..n].to_vec();
 
-            // if n == 0 {
-            //     return Err(RpcError::EmptyRequest);
-            // }
+                result = reader.next() => {
+                    match result {
+                        Some(Ok(line)) => {
+                            let req = line.as_bytes().to_vec();
 
-            let res = self.dispatcher.read().await.dispatch_rpc(&buf).await;
-            if let Ok(r) = res {
-                let _ = self.socket.write(&r).await;
-                continue;
-            } else {
-                let err = res.unwrap_err();
-                if !err.to_string().contains("found") {
-                    let err_msg = ErrorRes {
-                        error: err.to_string(),
+                            match self.dispatcher.read().await.dispatch_rpc(&req).await {
+                                Ok(res) => {
+                                    writer.write_all(&res).await?;
+                                    writer.write_all(b"\n").await?;
+                                    writer.flush().await?;
+                                    continue;
+                                },
+                                Err(RpcError::MethodNotFound(_)) => {
+                                },
+                                Err(err) => {
+                                    let err_msg = ErrorRes {
+                                        error: err.to_string(),
+                                    }
+                                    .serialize();
+
+                                    writer.write_all(err_msg.as_bytes()).await?;
+                                    writer.write_all(b"\n").await?;
+                                    writer.flush().await?;
+                                    continue;
+                                },
+                            };
+
+                            match self.dispatcher.read().await.dispatch_stream(&req).await {
+                                Ok(mut stream) => {
+                                    while let Some(msg) = stream.recv().await {
+                                        if msg.contains("exit") {
+                                            stream.close();
+                                            break;
+                                        }
+                                        writer.write_all(msg.as_bytes()).await?;
+                                        writer.write_all(b"\n").await?;
+                                        writer.flush().await?;
+                                    }
+                                }
+                                Err(err) => {
+                                    let err_msg = ErrorRes {
+                                        error: err.to_string(),
+                                    }
+                                    .serialize();
+
+                                    writer.write_all(err_msg.as_bytes()).await?;
+                                    writer.write_all(b"\n").await?;
+                                    writer.flush().await?;
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            return Err(e.into());
+                        }
+                        None => {
+                            return Ok(());
+                        }
                     }
-                    .serialize()
-                        + "\n";
-                    let _ = self.socket.write(err_msg.as_bytes()).await;
-                    continue;
                 }
-            }
-
-            let res = self.dispatcher.read().await.dispatch_stream(&buf).await;
-            if let Err(err) = res {
-                let err_msg = ErrorRes {
-                    error: err.to_string(),
-                }
-                .serialize()
-                    + "\n";
-                let _ = self.socket.write(err_msg.as_bytes()).await;
-                continue;
-            }
-            let mut res_ch = res.unwrap();
-            while let Some(msg) = res_ch.recv().await {
-                if msg.contains("exit") {
-                    res_ch.close();
-                    break;
-                }
-
-                let _ = self.socket.write(msg.as_bytes()).await;
             }
         }
-
-        Ok(())
     }
 }
-
 #[derive(Debug)]
 pub(crate) struct Shutdown {
     is_shutdown: bool,
@@ -243,9 +264,9 @@ impl Shutdown {
         }
     }
 
-    pub(crate) fn is_shutdown(&self) -> bool {
-        self.is_shutdown
-    }
+    // pub(crate) fn is_shutdown(&self) -> bool {
+    //     self.is_shutdown
+    // }
 
     pub(crate) async fn recv(&mut self) {
         if self.is_shutdown {

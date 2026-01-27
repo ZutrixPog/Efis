@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
+use dashmap::DashMap;
 use macros::{rpc_func, rpc_impl, rpc_stream, rpc_struct};
-use std::mem::MaybeUninit;
-use std::sync::Once;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use std::sync::OnceLock;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Duration;
 
 use crate::commands::Command;
@@ -11,18 +11,18 @@ use crate::consensus::{CommitEntry, ConsensusHandle};
 use crate::efis::types::{GetRes, OkRes, VSearchRes};
 use crate::pubsub::PubSubGuard;
 use crate::rpc::{dispatcher::Dispatcher, RpcStruct};
-use crate::rpc::{Deserialize, Serialize};
+use crate::rpc::{Deserialize, RpcError, Serialize};
 use crate::store::{DatastoreGuard, Value};
 use crate::vector::flat::FlatIndex;
-use crate::vector::{cosine_sim, Index};
+use crate::vector::{Distance, Index};
 
 macro_rules! handle_commands {
     ($self_var:ident, $cmd_var:ident, $( $cmd:ident => $func:ident ),* $(,)? ) => {
         match $cmd_var.command {
             $(
                 Command::$cmd(req) => {
-                    let res = $self_var.$func(req);
-                    if let Some(ch) = $self_var.subs.read().await.get(&$cmd_var.index) {
+                    let res = $self_var.$func(req).await;
+                    if let Some(ch) = $self_var.subs.remove(&$cmd_var.index) {
                         let lr = match res {
                             Ok(val) => {
                                 let any_val = &val as &dyn std::any::Any;
@@ -36,7 +36,7 @@ macro_rules! handle_commands {
                             }
                             Err(err) => LateRes::Err(err.to_string()),
                         };
-                        let _ = ch.send(lr);
+                        let _ = ch.1.send(lr);
                     }
                 }
             )*
@@ -121,7 +121,12 @@ pub mod types {
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, SerDe)]
     pub struct VSetReq {
         pub key: String,
-        pub id: String,
+        pub vecs: Vec<VecReq>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, SerDe)]
+    pub struct VecReq {
+        pub id: u64,
         pub vec: Vec<f32>,
     }
 
@@ -140,7 +145,7 @@ pub mod types {
 
     #[derive(SerDe)]
     pub struct VSearchRes {
-        pub ids: Vec<String>,
+        pub ids: Vec<u64>,
     }
 }
 
@@ -157,8 +162,10 @@ pub struct Efis {
     pub pubsub: PubSubGuard,
     cons: Option<&'static ConsensusHandle>,
     cmd_ch_tx: broadcast::Sender<CommitEntry>,
-    subs: RwLock<HashMap<usize, broadcast::Sender<LateRes>>>,
+    subs: DashMap<usize, oneshot::Sender<LateRes>>,
 }
+
+static INSTANCE: OnceLock<&'static Efis> = OnceLock::new();
 
 #[rpc_impl]
 impl Efis {
@@ -173,7 +180,7 @@ impl Efis {
             pubsub: ps,
             cons,
             cmd_ch_tx: tx,
-            subs: RwLock::new(HashMap::new()),
+            subs: DashMap::new(),
         };
 
         s
@@ -184,19 +191,13 @@ impl Efis {
         ps: PubSubGuard,
         cons: Option<&'static ConsensusHandle>,
     ) -> &'static Self {
-        static mut SINGLETON: MaybeUninit<Efis> = MaybeUninit::uninit();
-        static ONCE: Once = Once::new();
+        INSTANCE.get_or_init(|| {
+            let boxed = Box::new(Self::new(ds, ps, cons));
+            let static_ref: &'static Efis = Box::leak(boxed);
 
-        unsafe {
-            ONCE.call_once(|| {
-                let singleton = Self::new(ds, ps, cons);
-                SINGLETON.write(singleton);
-            });
-
-            let s = SINGLETON.assume_init_ref();
-            s.process_cmd();
-            s
-        }
+            static_ref.process_cmd();
+            static_ref
+        })
     }
 
     fn process_cmd(&'static self) {
@@ -236,15 +237,11 @@ impl Efis {
 
     async fn handle_consensus(&self, cmd: Command) -> LateRes {
         let cons = self.cons.unwrap();
+        let (tx, rx) = oneshot::channel();
         if let Some(index) = cons.submit(cmd).await {
-            let (tx, rx) = broadcast::channel(16);
+            self.subs.insert(index, tx);
 
-            self.subs.write().await.insert(index, tx);
-
-            let mut sub = rx.resubscribe();
-
-            let res =
-                tokio::time::timeout(Duration::from_secs(5), async { sub.recv().await }).await;
+            let res = tokio::time::timeout(Duration::from_secs(5), async { rx.await }).await;
 
             match res {
                 Ok(Ok(lres)) => lres,
@@ -257,27 +254,28 @@ impl Efis {
     }
 
     #[rpc_func]
-    async fn set(&'static self, req: types::SetReq) -> anyhow::Result<types::OkRes> {
+    async fn set(&'static self, req: types::SetReq) -> Result<types::OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Set(req)).await {
                 LateRes::Ok(ok) => Ok(ok),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::format_err!("internal error"))),
             }
         } else {
-            self._set(req)
+            self._set(req).await
         }
     }
 
-    fn _set(&self, req: types::SetReq) -> anyhow::Result<types::OkRes> {
+    async fn _set(&self, req: types::SetReq) -> Result<types::OkRes, RpcError> {
         let duration = req.exp.map(Duration::from_secs);
         let res = self
             .store
             .store()
-            .set(req.key.clone(), Value::Text(req.value.clone()), duration);
+            .set(req.key, Value::Text(req.value), duration)
+            .await;
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(OkRes {
                 status: "ok".to_string(),
@@ -286,11 +284,12 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn get(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    fn get(&'static self, req: types::GetReq) -> Result<types::GetRes<String>, RpcError> {
         let res = self
             .store
             .store()
             .get(req.key.as_str())
+            .await
             .ok_or(anyhow::format_err!("key not found: {}", req.key))
             .and_then(|value| match value {
                 Value::Text(text) => Ok(text),
@@ -298,35 +297,36 @@ impl Efis {
             });
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(types::GetRes { val: res.unwrap() })
         }
     }
 
     #[rpc_func]
-    async fn delete(&'static self, req: types::GetReq) -> anyhow::Result<types::OkRes> {
+    async fn delete(&'static self, req: types::GetReq) -> Result<types::OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Delete(req)).await {
                 LateRes::Ok(ok) => Ok(ok),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::format_err!("internal error"))),
             }
         } else {
-            self._delete(req)
+            self._delete(req).await
         }
     }
 
-    fn _delete(&self, req: types::GetReq) -> anyhow::Result<types::OkRes> {
+    async fn _delete(&self, req: types::GetReq) -> Result<types::OkRes, RpcError> {
         let res = self
             .store
             .store()
             .remove(req.key.as_str())
+            .await
             .map_err(|_| anyhow::format_err!("key not found: {}", req.key))
             .map(|_| ());
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(OkRes {
                 status: "ok".to_string(),
@@ -335,36 +335,42 @@ impl Efis {
     }
 
     #[rpc_func]
-    async fn increment(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn increment(
+        &'static self,
+        req: types::GetReq,
+    ) -> Result<types::GetRes<String>, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Increment(req)).await {
                 LateRes::Value(val) => Ok(val),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._increment(req)
+            self._increment(req).await
         }
     }
 
-    fn _increment(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
-        let mut store = self.store.store();
-        let res = store.modify(req.key.as_str(), |value| {
-            if let Value::Text(val) = value {
-                if let Ok(num) = val.parse::<f64>() {
-                    val.clear();
-                    val.extend((num + 1.0).to_string().chars())
+    async fn _increment(&self, req: types::GetReq) -> Result<types::GetRes<String>, RpcError> {
+        let store = self.store.store();
+        let res = store
+            .modify(req.key.as_str(), |value| {
+                if let Value::Text(val) = value {
+                    if let Ok(num) = val.parse::<f64>() {
+                        val.clear();
+                        val.extend((num + 1.0).to_string().chars())
+                    }
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            })
+            .await;
 
         if res.is_err() {
-            return Err(anyhow::anyhow!(res.unwrap_err()));
+            return Err(RpcError::Internal(res.unwrap_err()));
         }
 
         let res = store
             .get(req.key.as_str())
+            .await
             .ok_or(anyhow::format_err!("key not found"))
             .and_then(|value| match value {
                 Value::Text(val) => Ok(val),
@@ -372,39 +378,45 @@ impl Efis {
             });
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(types::GetRes { val: res.unwrap() })
         }
     }
 
     #[rpc_func]
-    async fn decrement(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn decrement(
+        &'static self,
+        req: types::GetReq,
+    ) -> Result<types::GetRes<String>, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Decrement(req)).await {
                 LateRes::Value(val) => Ok(val),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._decrement(req)
+            self._decrement(req).await
         }
     }
 
-    fn _decrement(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
-        let mut store = self.store.store();
-        store.modify(req.key.as_str(), |value| {
-            if let Value::Text(val) = value {
-                if let Ok(num) = val.parse::<f64>() {
-                    val.clear();
-                    val.extend((num - 1.0).to_string().chars())
+    async fn _decrement(&self, req: types::GetReq) -> Result<types::GetRes<String>, RpcError> {
+        let store = self.store.store();
+        store
+            .modify(req.key.as_str(), |value| {
+                if let Value::Text(val) = value {
+                    if let Ok(num) = val.parse::<f64>() {
+                        val.clear();
+                        val.extend((num - 1.0).to_string().chars())
+                    }
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })
+            .await?;
 
         let res = store
             .get(req.key.as_str())
+            .await
             .ok_or(anyhow::format_err!("key not found"))
             .and_then(|value| match value {
                 Value::Text(val) => Ok(val),
@@ -412,33 +424,34 @@ impl Efis {
             });
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(types::GetRes { val: res.unwrap() })
         }
     }
 
     #[rpc_func]
-    async fn expire(&'static self, req: types::ExpireReq) -> anyhow::Result<OkRes> {
+    async fn expire(&'static self, req: types::ExpireReq) -> Result<OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Expire(req)).await {
                 LateRes::Ok(ok) => Ok(ok),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._expire(req)
+            self._expire(req).await
         }
     }
 
-    fn _expire(&self, req: types::ExpireReq) -> anyhow::Result<OkRes> {
+    async fn _expire(&self, req: types::ExpireReq) -> Result<OkRes, RpcError> {
         let res = self
             .store
             .store()
-            .expire(req.key.as_str(), Duration::from_secs(req.duration));
+            .expire(req.key.as_str(), Duration::from_secs(req.duration))
+            .await;
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(OkRes {
                 status: "ok".to_string(),
@@ -447,50 +460,55 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn ttl(&'static self, req: types::GetReq) -> anyhow::Result<types::TtlRes> {
+    async fn ttl(&'static self, req: types::GetReq) -> Result<types::TtlRes, RpcError> {
         let res = self
             .store
             .store()
             .ttl(req.key.as_str())
+            .await
             .and_then(|ttl| match ttl {
                 Some(duration) => Ok(duration.as_secs().to_string()),
                 None => Ok("-1".to_string()),
             });
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(types::TtlRes { ttl: res.unwrap() })
         }
     }
 
     #[rpc_func]
-    async fn lpush(&'static self, req: types::ListReq) -> anyhow::Result<OkRes> {
+    async fn lpush(&'static self, req: types::ListReq) -> Result<OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Lpush(req)).await {
                 LateRes::Ok(ok) => Ok(ok),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._lpush(req)
+            self._lpush(req).await
         }
     }
 
-    fn _lpush(&self, req: types::ListReq) -> anyhow::Result<OkRes> {
-        let mut store = self.store.store();
-        store.set(req.key.clone(), Value::List(VecDeque::new()), None)?;
-        let res = store.modify(req.key.as_str(), |list| {
-            if let Value::List(list_data) = list {
-                for item in req.values.into_iter() {
-                    list_data.push_front(item.to_string());
+    async fn _lpush(&self, req: types::ListReq) -> Result<OkRes, RpcError> {
+        let store = self.store.store();
+        store
+            .set(req.key.clone(), Value::List(VecDeque::new()), None)
+            .await?;
+        let res = store
+            .modify(req.key.as_str(), |list| {
+                if let Value::List(list_data) = list {
+                    for item in req.values.into_iter() {
+                        list_data.push_front(item.to_string());
+                    }
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            })
+            .await;
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(OkRes {
                 status: "ok".to_string(),
@@ -499,31 +517,35 @@ impl Efis {
     }
 
     #[rpc_func]
-    async fn rpush(&'static self, req: types::ListReq) -> anyhow::Result<types::OkRes> {
+    async fn rpush(&'static self, req: types::ListReq) -> Result<types::OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Rpush(req)).await {
                 LateRes::Ok(ok) => Ok(ok),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._rpush(req)
+            self._rpush(req).await
         }
     }
 
-    fn _rpush(&self, req: types::ListReq) -> anyhow::Result<types::OkRes> {
-        let mut store = self.store.store();
-        store.set(req.key.clone(), Value::List(VecDeque::new()), None)?;
+    async fn _rpush(&self, req: types::ListReq) -> Result<types::OkRes, RpcError> {
+        let store = self.store.store();
+        store
+            .set(req.key.clone(), Value::List(VecDeque::new()), None)
+            .await?;
         let value: Vec<String> = req.values.into_iter().map(|v| v.to_string()).collect();
-        let res = store.modify(req.key.as_str(), |list| {
-            if let Value::List(list_data) = list {
-                list_data.extend(value);
-            }
-            Ok(())
-        });
+        let res = store
+            .modify(req.key.as_str(), |list| {
+                if let Value::List(list_data) = list {
+                    list_data.extend(value);
+                }
+                Ok(())
+            })
+            .await;
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(OkRes {
                 status: "ok".to_string(),
@@ -532,93 +554,103 @@ impl Efis {
     }
 
     #[rpc_func]
-    async fn lpop(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn lpop(&'static self, req: types::GetReq) -> Result<types::GetRes<String>, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Lpop(req)).await {
                 LateRes::Value(val) => Ok(val),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._lpop(req)
+            self._lpop(req).await
         }
     }
 
-    fn _lpop(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn _lpop(&self, req: types::GetReq) -> Result<types::GetRes<String>, RpcError> {
         let mut res = Err(anyhow::format_err!("failed to pop value"));
-        self.store.store().modify(req.key.as_str(), |list| {
-            if let Value::List(list_data) = list {
-                if let Some(value) = list_data.pop_front() {
-                    res = Ok(value);
+        self.store
+            .store()
+            .modify(req.key.as_str(), |list| {
+                if let Value::List(list_data) = list {
+                    if let Some(value) = list_data.pop_front() {
+                        res = Ok(value);
+                    }
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })
+            .await?;
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(GetRes { val: res.unwrap() })
         }
     }
 
     #[rpc_func]
-    async fn rpop(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn rpop(&'static self, req: types::GetReq) -> Result<types::GetRes<String>, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Rpop(req)).await {
                 LateRes::Value(val) => Ok(val),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._rpop(req)
+            self._rpop(req).await
         }
     }
 
-    fn _rpop(&self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn _rpop(&self, req: types::GetReq) -> Result<types::GetRes<String>, RpcError> {
         let mut res = Err(anyhow::format_err!("failed to pop value"));
-        self.store.store().modify(req.key.as_str(), |list| {
-            if let Value::List(list_data) = list {
-                if let Some(value) = list_data.pop_back() {
-                    res = Ok(value);
+        self.store
+            .store()
+            .modify(req.key.as_str(), |list| {
+                if let Value::List(list_data) = list {
+                    if let Some(value) = list_data.pop_back() {
+                        res = Ok(value);
+                    }
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })
+            .await?;
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(GetRes { val: res.unwrap() })
         }
     }
 
     #[rpc_func]
-    async fn sadd(&'static self, req: types::ListReq) -> anyhow::Result<OkRes> {
+    async fn sadd(&'static self, req: types::ListReq) -> Result<OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Sadd(req)).await {
                 LateRes::Ok(ok) => Ok(ok),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._sadd(req)
+            self._sadd(req).await
         }
     }
 
-    fn _sadd(&self, req: types::ListReq) -> anyhow::Result<OkRes> {
-        let mut store = self.store.store();
-        store.set(req.key.clone(), Value::Set(HashSet::new()), None)?;
+    async fn _sadd(&self, req: types::ListReq) -> Result<OkRes, RpcError> {
+        let store = self.store.store();
+        store
+            .set(req.key.clone(), Value::Set(HashSet::new()), None)
+            .await?;
         let value: Vec<String> = req.values.into_iter().map(|v| v.to_string()).collect();
-        let res = store.modify(req.key.as_str(), |set| {
-            if let Value::Set(set_data) = set {
-                set_data.extend(value);
-            }
-            Ok(())
-        });
+        let res = store
+            .modify(req.key.as_str(), |set| {
+                if let Value::Set(set_data) = set {
+                    set_data.extend(value);
+                }
+                Ok(())
+            })
+            .await;
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(OkRes {
                 status: "ok".to_string(),
@@ -627,11 +659,15 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn smembers(&'static self, req: types::GetReq) -> anyhow::Result<types::GetRes<String>> {
+    async fn smembers(
+        &'static self,
+        req: types::GetReq,
+    ) -> Result<types::GetRes<String>, RpcError> {
         let res = self
             .store
             .store()
             .get(req.key.as_str())
+            .await
             .ok_or(anyhow::format_err!("key not found"))
             .and_then(|value| match value {
                 Value::Set(set_data) => Ok(format!("{:?}", set_data)),
@@ -639,37 +675,41 @@ impl Efis {
             });
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(GetRes { val: res.unwrap() })
         }
     }
 
     #[rpc_func]
-    async fn zadd(&'static self, req: types::MapReq) -> anyhow::Result<types::OkRes> {
+    async fn zadd(&'static self, req: types::MapReq) -> Result<types::OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Zadd(req)).await {
                 LateRes::Ok(ok) => Ok(ok),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._zadd(req)
+            self._zadd(req).await
         }
     }
 
-    fn _zadd(&self, req: types::MapReq) -> anyhow::Result<types::OkRes> {
-        let mut store = self.store.store();
-        store.set(req.key.clone(), Value::SortedSet(BTreeMap::new()), None)?;
-        let res = store.modify(req.key.as_str(), |zset| {
-            if let Value::SortedSet(zset_data) = zset {
-                zset_data.insert(req.score, req.value);
-            }
-            Ok(())
-        });
+    async fn _zadd(&self, req: types::MapReq) -> Result<types::OkRes, RpcError> {
+        let store = self.store.store();
+        store
+            .set(req.key.clone(), Value::SortedSet(BTreeMap::new()), None)
+            .await?;
+        let res = store
+            .modify(req.key.as_str(), |zset| {
+                if let Value::SortedSet(zset_data) = zset {
+                    zset_data.insert(req.score, req.value);
+                }
+                Ok(())
+            })
+            .await;
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(OkRes {
                 status: "ok".to_string(),
@@ -678,11 +718,12 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn zrange(&'static self, req: types::MapRange) -> anyhow::Result<types::ListRes> {
+    async fn zrange(&'static self, req: types::MapRange) -> Result<types::ListRes, RpcError> {
         let res = self
             .store
             .store()
             .get(req.key.as_str())
+            .await
             .ok_or(anyhow::format_err!("key not found"))
             .and_then(|value| match value {
                 Value::SortedSet(zset_data) => {
@@ -702,29 +743,29 @@ impl Efis {
             });
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(types::ListRes { vals: res.unwrap() })
         }
     }
 
     #[rpc_func]
-    fn publish(&'static self, req: types::PubReq) -> anyhow::Result<OkRes> {
+    async fn publish(&'static self, req: types::PubReq) -> Result<OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Publish(req)).await {
                 LateRes::Ok(ok) => Ok(ok),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._publish(req)
+            self._publish(req).await
         }
     }
 
-    fn _publish(&'static self, req: types::PubReq) -> anyhow::Result<OkRes> {
+    async fn _publish(&'static self, req: types::PubReq) -> Result<OkRes, RpcError> {
         let sent = self.pubsub.ps().publish(req.chan, req.value);
         if sent == 0 && self.cons.is_none() {
-            return Err(anyhow::anyhow!("failed to publish"));
+            return Err(RpcError::Internal(anyhow::anyhow!("failed to publish")));
         }
         Ok(types::OkRes {
             status: "ok".to_string(),
@@ -732,7 +773,7 @@ impl Efis {
     }
 
     #[rpc_stream]
-    fn subscribe(&'static self, req: types::SubReq) -> anyhow::Result<mpsc::Receiver<String>> {
+    fn subscribe(&'static self, req: types::SubReq) -> Result<mpsc::Receiver<String>, RpcError> {
         let (tx, rx) = mpsc::channel(10);
         let mut sub = self.pubsub.ps().subscribe(req.chan);
         tokio::spawn(async move {
@@ -745,36 +786,51 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn vset(&'static self, req: types::VSetReq) -> anyhow::Result<OkRes> {
+    async fn vset(&'static self, req: types::VSetReq) -> Result<OkRes, RpcError> {
+        // if req.ids.len() != req.vecs.len() {
+        //     return Err(RpcError::Internal(anyhow::anyhow!(
+        //         "ids length should be equal to vecs"
+        //     )));
+        // }
+        //
         if self.cons.is_some() {
             match self.handle_consensus(Command::VSet(req)).await {
                 LateRes::Ok(ok) => Ok(ok),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._vset(req)
+            self._vset(req).await
         }
     }
 
-    fn _vset(&self, req: types::VSetReq) -> anyhow::Result<types::OkRes> {
-        if self.store.store().get(&req.key).is_none() {
-            self.store.store().set(
-                req.key.clone(),
-                Value::Vector(FlatIndex::new(req.vec.len())),
-                None,
-            )?;
+    async fn _vset(&self, req: types::VSetReq) -> Result<types::OkRes, RpcError> {
+        if self.store.store().get(&req.key).await.is_none() {
+            self.store
+                .store()
+                .set(
+                    req.key.clone(),
+                    Value::Vector(FlatIndex::new(req.vecs[0].vec.len())),
+                    None,
+                )
+                .await?;
         }
 
-        let res = self.store.store().modify(req.key.as_str(), |value| {
-            if let Value::Vector(val) = value {
-                return val.insert(req.id, &req.vec);
-            }
-            Ok(())
-        });
+        let res = self
+            .store
+            .store()
+            .modify(req.key.as_str(), |value| {
+                if let Value::Vector(val) = value {
+                    for (i, vec) in req.vecs.iter().enumerate() {
+                        let _ = val.insert(req.vecs[i].id, &vec.vec);
+                    }
+                }
+                Ok(())
+            })
+            .await;
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(OkRes {
                 status: "ok".to_string(),
@@ -783,28 +839,29 @@ impl Efis {
     }
 
     #[rpc_func]
-    async fn vdel(&'static self, req: types::VDelReq) -> anyhow::Result<types::OkRes> {
+    async fn vdel(&'static self, req: types::VDelReq) -> Result<types::OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::VDel(req)).await {
                 LateRes::Ok(ok) => Ok(ok),
-                LateRes::Err(err) => Err(anyhow::format_err!(err)),
-                _ => Err(anyhow::format_err!("internal error")),
+                LateRes::Err(err) => Err(RpcError::Internal(anyhow::format_err!(err))),
+                _ => Err(RpcError::Internal(anyhow::anyhow!("internal error"))),
             }
         } else {
-            self._vdel(req)
+            self._vdel(req).await
         }
     }
 
-    fn _vdel(&self, req: types::VDelReq) -> anyhow::Result<types::OkRes> {
+    async fn _vdel(&self, req: types::VDelReq) -> Result<types::OkRes, RpcError> {
         let res = self
             .store
             .store()
             .remove(req.key.as_str())
+            .await
             .map_err(|_| anyhow::format_err!("key not found: {}", req.key))
             .map(|_| ());
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(OkRes {
                 status: "ok".to_string(),
@@ -813,16 +870,17 @@ impl Efis {
     }
 
     #[rpc_func]
-    fn vsearch(&'static self, req: types::VSearchReq) -> anyhow::Result<VSearchRes> {
+    async fn vsearch(&'static self, req: types::VSearchReq) -> Result<VSearchRes, RpcError> {
         let res = self
             .store
             .store()
             .get(req.key.as_str())
+            .await
             .ok_or(anyhow::format_err!("key not found"))
             .and_then(|value| match value {
                 Value::Vector(index) => {
                     let res = index
-                        .search(&req.query, req.k, cosine_sim)
+                        .search(&req.query, req.k, Distance::Cosine)
                         .into_iter()
                         .map(|(id, _)| id)
                         .collect();
@@ -832,7 +890,7 @@ impl Efis {
             });
 
         if res.is_err() {
-            Err(anyhow::anyhow!(res.unwrap_err()))
+            Err(RpcError::Internal(res.unwrap_err()))
         } else {
             Ok(types::VSearchRes { ids: res.unwrap() })
         }
@@ -853,7 +911,7 @@ mod tests {
         let sguard = DatastoreGuard::new(None, None).await;
         let pguard = PubSubGuard::new();
 
-        let con_storage = ConFileStorage::new(PathBuf::from_str("/var/efis").unwrap());
+        let con_storage = ConFileStorage::new(PathBuf::from_str("/var/efis").unwrap()).await;
         let (mut cons, _) = Consensus::new("0".to_string(), con_storage).await;
         tokio::spawn(async move {
             cons.start(vec![]).await;
