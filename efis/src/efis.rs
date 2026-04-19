@@ -805,9 +805,9 @@ impl Efis {
     }
 
     async fn _vset(&self, req: types::VSetReq) -> Result<types::OkRes, RpcError> {
-        if self.store.store().get(&req.key).await.is_none() {
-            self.store
-                .store()
+        let store = self.store.store();
+        if store.get(&req.key).await.is_none() {
+            store
                 .set(
                     req.key.clone(),
                     Value::Vector(FlatIndex::new(req.vecs[0].vec.len())),
@@ -816,9 +816,7 @@ impl Efis {
                 .await?;
         }
 
-        let res = self
-            .store
-            .store()
+        let res = store
             .modify(req.key.as_str(), |value| {
                 if let Value::Vector(val) = value {
                     for (i, vec) in req.vecs.iter().enumerate() {

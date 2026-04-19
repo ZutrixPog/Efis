@@ -1,4 +1,4 @@
-port := '8080'
+port := '9393'
 persist_interval := '20'
 persist_path := '/home/erfan/.local/efis'
 

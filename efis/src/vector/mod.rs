@@ -34,8 +34,9 @@ impl Ord for F32 {
     }
 }
 
+#[inline]
 pub fn l2_distance(a: Vector, b: Vector) -> f32 {
-    a.par_iter()
+    a.iter()
         .zip(b)
         .map(|(x, y)| {
             let d = x - y;
@@ -45,6 +46,7 @@ pub fn l2_distance(a: Vector, b: Vector) -> f32 {
 }
 
 // NOTE: expects vectors to be normalized
+#[inline]
 pub fn cosine_sim(a: Vector, b: Vector) -> f32 {
-    -a.par_iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
+    -a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
 }

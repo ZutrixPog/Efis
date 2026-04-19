@@ -4,9 +4,9 @@ import random
 import numpy as np
 
 HOST = "127.0.0.1"
-PORT = 3335
+PORT = 3333
 
-n = 300
+n = 30000
 
 def format_vector(vec):
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
@@ -24,7 +24,7 @@ def main():
     start = time.time()
 
     for i in range(n):
-        cmd = f"set key=test value=sth{i}sth"
+        cmd = f"set key=test{i} value=sth{i}sth"
         send_cmd(sock, cmd)
 
         if i % 2 == 0:
@@ -32,8 +32,8 @@ def main():
 
     insert_time = time.time() - start
 
-    print(f"\nInserted {n} vectors in {insert_time:.2f}s")
-    print(f"Insert throughput: {n / insert_time:.2f} vec/s")
+    print(f"\nUpdated key {n} times in {insert_time:.2f}s")
+    print(f"Update throughput: {n / insert_time:.2f} keys/s")
 
     sock.close()
 

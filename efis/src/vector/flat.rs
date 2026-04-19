@@ -57,25 +57,20 @@ impl Index for FlatIndex {
             Distance::Cosine => cosine_sim,
         };
 
-        self.ids
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| {
-                let start = self.dim * i;
-                (id, F32(dist_fn(&self.vecs[start..start + self.dim], query)))
-            })
-            .fold(BinaryHeap::with_capacity(k), |mut heap, (id, d)| {
-                if heap.len() < k {
-                    heap.push((Reverse(d), id));
-                } else if heap.peek().unwrap().0 .0 > d {
-                    heap.pop();
-                    heap.push((Reverse(d), id));
-                }
-                heap
-            })
-            .into_iter()
-            .map(|(Reverse(f), i)| (i, f.0))
-            .collect()
+        let mut distances: Vec<(u64, f32)> = self
+            .vecs
+            .par_chunks(self.dim)
+            .zip(self.ids.par_iter())
+            .map(|(chunk, &id)| (id, dist_fn(chunk, query)))
+            .collect();
+
+        let k = k.min(distances.len());
+        distances.select_nth_unstable_by(k - 1, |a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        distances.truncate(k);
+        distances.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        distances
     }
 
     fn delete(&mut self, id: u64) {
@@ -94,7 +89,8 @@ impl Index for FlatIndex {
                 self.vecs[i] = self.vecs[new_len + i - start];
             }
             self.vecs.truncate(new_len);
-            self.ids.remove(i);
+            self.ids.swap_remove(i);
+            self.idset.remove(&id);
         }
     }
 }
