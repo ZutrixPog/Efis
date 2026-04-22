@@ -36,6 +36,18 @@ pub enum RpcError {
 
     #[error("handler failed: {0}")]
     Internal(#[from] anyhow::Error),
+
+    #[error("not leader, redirect to {0}")]
+    NotLeader(String),
+}
+
+impl Serialize for RpcError {
+    fn serialize(&self) -> String {
+        match self {
+            RpcError::NotLeader(id) => format!("{{error=\"not_leader\" leader={}}}", id),
+            _ => format!("{{error=\"{}\"}}", self),
+        }
+    }
 }
 
 #[derive(macros::SerDe)]

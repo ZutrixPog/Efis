@@ -1,13 +1,12 @@
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::cmp::PartialEq;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::convert::From;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 use std::time::SystemTime;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 use tokio::time::{interval, Duration};
 use tracing::{error, info};
 
@@ -153,8 +152,7 @@ impl Datastore {
         Ok(())
     }
 
-    pub async fn get(&self, key: &str) -> Option<Value> {
-        tokio::task::spawn_blocking(|| {});
+    pub fn get_sync(&self, key: &str) -> Option<Value> {
         if let Some(item) = self.data.get(key) {
             if let Some(expiry) = item.expiry {
                 if expiry <= SystemTime::now() {
@@ -167,6 +165,10 @@ impl Datastore {
         } else {
             None
         }
+    }
+
+    pub async fn get(&self, key: &str) -> Option<Value> {
+        self.get_sync(key)
     }
 
     pub async fn remove(&self, key: &str) -> anyhow::Result<()> {
@@ -238,6 +240,7 @@ impl From<Vec<u8>> for DatastoreGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tokio::time::sleep;
 
     #[tokio::test]

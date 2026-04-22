@@ -10,6 +10,24 @@ use crate::rpc::{Deserialize, ErrorRes};
 
 use super::Serialize;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    #[error("connection error: {0}")]
+    Connection(#[from] anyhow::Error),
+
+    #[error("not leader, redirect to {0}")]
+    Redirect(String),
+
+    #[error("server error: {0}")]
+    Server(String),
+}
+
+impl From<tokio::sync::oneshot::error::RecvError> for ClientError {
+    fn from(e: tokio::sync::oneshot::error::RecvError) -> Self {
+        ClientError::Connection(anyhow::anyhow!("Channel closed: {}", e))
+    }
+}
+
 enum ClientMsg {
     Call {
         payload: Vec<u8>,
@@ -25,18 +43,21 @@ enum ClientMsg {
 pub struct Client {
     sender: mpsc::Sender<ClientMsg>,
     connected: Arc<AtomicBool>,
+    addr: Arc<std::sync::RwLock<String>>,
 }
 
 impl Client {
     pub fn new(addr: String) -> Self {
         let (tx, rx) = mpsc::channel(32);
         let connected = Arc::new(AtomicBool::new(false));
+        let addr_clone = addr.clone();
 
-        tokio::spawn(io_loop(addr, rx, connected.clone()));
+        tokio::spawn(io_loop(addr_clone, rx, connected.clone()));
 
         Self {
             sender: tx,
             connected,
+            addr: Arc::new(std::sync::RwLock::new(addr)),
         }
     }
 
@@ -44,11 +65,19 @@ impl Client {
         self.connected.load(Ordering::Relaxed)
     }
 
+    pub fn addr(&self) -> String {
+        self.addr.read().unwrap().clone()
+    }
+
+    pub fn redirect_to(&self, new_addr: String) {
+        *self.addr.write().unwrap() = new_addr;
+    }
+
     pub async fn call<T: Deserialize + Send>(
         &self,
         method: &str,
         req: &dyn Serialize,
-    ) -> anyhow::Result<T> {
+    ) -> Result<T, ClientError> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
         let payload = format!("{} {}\n", method, req.serialize()).into_bytes();
@@ -60,10 +89,37 @@ impl Client {
 
         let raw_resp = resp_rx.await??;
 
-        if let Ok(err) = ErrorRes::deserialize(&raw_resp) {
-            return Err(anyhow::anyhow!(err.error));
+        if let Some(leader) = parse_redirect(&raw_resp) {
+            return Err(ClientError::Redirect(leader));
         }
-        T::deserialize(&raw_resp).map_err(|e| anyhow::anyhow!("DeDe Error: {}", e))
+
+        if let Ok(err_res) = ErrorRes::deserialize(&raw_resp) {
+            return Err(ClientError::Server(err_res.error));
+        }
+        T::deserialize(&raw_resp).map_err(|e| ClientError::Server(format!("Deserialize error: {}", e)))
+    }
+
+    pub async fn call_with_redirect<T: Deserialize + Send>(
+        &self,
+        method: &str,
+        req: &dyn Serialize,
+    ) -> Result<T, ClientError> {
+        loop {
+            match self.call(method, req).await {
+                Err(ClientError::Redirect(leader)) => {
+                    let leader_port = leader
+                        .trim_start_matches('n')
+                        .parse::<u16>()
+                        .map(|n| 3332 + n)
+                        .unwrap_or(3333);
+                    let leader_addr = format!("localhost:{}", leader_port);
+                    self.redirect_to(leader_addr.clone());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                other => break other,
+            }
+        }
     }
 
     pub async fn call_stream<T: Deserialize + Send + 'static>(
@@ -196,6 +252,17 @@ async fn process_stream(
             }
         }
     }
+}
+
+fn parse_redirect(response: &str) -> Option<String> {
+    if !response.contains("not_leader") {
+        return None;
+    }
+    response
+        .split("leader=")
+        .nth(1)
+        .and_then(|s| s.trim_end_matches('}').trim().split_whitespace().next())
+        .map(|s| s.to_string())
 }
 
 #[cfg(test)]

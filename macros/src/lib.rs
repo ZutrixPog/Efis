@@ -316,20 +316,52 @@ pub fn rpc_impl(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let method_name_str = method_name.to_string();
 
             if has_rpc_func_attr(&method.attrs) {
+                let requires_leader = has_requires_leader_attr(&method.attrs);
+                let leader_check = if requires_leader {
+                    quote! {
+                        if !crate::consensus::ConsensusHandle::is_leader() {
+                            let leader = crate::consensus::ConsensusHandle::leader_id()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            return Err(RpcError::NotLeader(leader));
+                        }
+                    }
+                } else {
+                    quote! {}
+                };
+
                 rpc_methods.push(quote! {
                     dispatcher.register_fn(
                         format!("{}", #method_name_str),
                         std::sync::Arc::new(move |req: String| {
-                            Box::pin(async move { self.#method_name(req).await })
+                            Box::pin(async move {
+                                #leader_check
+                                self.#method_name(req).await
+                            })
                         }),
                     );
                 });
             } else if has_rpc_stream_attr(&method.attrs) {
+                let requires_leader = has_requires_leader_attr(&method.attrs);
+                let leader_check = if requires_leader {
+                    quote! {
+                        if !crate::consensus::ConsensusHandle::is_leader() {
+                            let leader = crate::consensus::ConsensusHandle::leader_id()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            return Err(RpcError::NotLeader(leader));
+                        }
+                    }
+                } else {
+                    quote! {}
+                };
+
                 rpc_methods.push(quote! {
                     dispatcher.register_stream_fn(
                         format!("{}", #method_name_str),
                         std::sync::Arc::new(move |req: String| {
-                            Box::pin(async move { self.#method_name(req).await })
+                            Box::pin(async move {
+                                #leader_check
+                                self.#method_name(req).await
+                            })
                         }),
                     );
                 });
@@ -356,4 +388,15 @@ pub fn rpc_impl(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 fn has_rpc_func_attr(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("rpc_func"))
+}
+
+fn has_requires_leader_attr(attrs: &[Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("requires_leader"))
+}
+
+#[proc_macro_attribute]
+pub fn requires_leader(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
 }

@@ -17,6 +17,10 @@ use crate::rpc::dispatcher::Dispatcher;
 use crate::rpc::{Deserialize, RpcError, RpcStruct, Serialize};
 use macros::{rpc_func, rpc_impl, rpc_struct, SerDe};
 
+static LEADER_ID: std::sync::OnceLock<Arc<std::sync::RwLock<Option<String>>>> =
+    std::sync::OnceLock::new();
+static NODE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum State {
     Follower,
@@ -134,6 +138,23 @@ pub struct ConsensusHandle {
     tx: mpsc::Sender<ConsensusMsg>,
     pub commit_chan_tx: broadcast::Sender<CommitEntry>,
     log_index: Arc<AtomicUsize>,
+    node_id: &'static str,
+}
+
+impl ConsensusHandle {
+    pub fn leader_id() -> Option<String> {
+        LEADER_ID
+            .get()
+            .and_then(|l| l.read().ok().and_then(|v| v.clone()))
+    }
+
+    pub fn node_id() -> String {
+        NODE_ID.get().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    pub fn is_leader() -> bool {
+        Self::leader_id() == Some(Self::node_id())
+    }
 }
 
 #[rpc_impl]
@@ -146,6 +167,7 @@ impl Consensus {
         let (commit_chan_tx, _) = broadcast::channel(1024);
         let peers = Vec::new();
         let log_index = Arc::new(AtomicUsize::new(0));
+        let node_id = id.clone();
         let mut consensus = Consensus {
             id,
             peers,
@@ -173,6 +195,8 @@ impl Consensus {
         consensus.restore_state().await;
 
         static HNDL: OnceCell<ConsensusHandle> = OnceCell::const_new();
+        let _ = LEADER_ID.set(Arc::new(std::sync::RwLock::new(None)));
+        let _ = NODE_ID.set(node_id);
 
         (
             consensus,
@@ -180,6 +204,7 @@ impl Consensus {
                 tx,
                 commit_chan_tx: commit_chan_tx.clone(),
                 log_index: log_index,
+                node_id: NODE_ID.get().map(|s| s.as_str()).unwrap_or("unknown"),
             })
             .await,
         )
@@ -434,6 +459,12 @@ impl Consensus {
             self.become_follower(req.term).await;
         }
 
+        if req.term >= self.current_term && self.state == State::Follower {
+            if let Some(l) = LEADER_ID.get() {
+                *l.write().unwrap() = Some(req.leader.clone());
+            }
+        }
+
         let mut reply = AppendEntriesReply::default();
         reply.term = self.current_term;
 
@@ -593,6 +624,9 @@ impl Consensus {
         self.state = State::Follower;
         self.current_term = term;
         self.voted_for = None;
+        if let Some(l) = LEADER_ID.get() {
+            *l.write().unwrap() = None;
+        }
         self.election_reset_event = Some(SystemTime::now());
         self.persist_state().await;
         self.spawn_election_timer().await;
@@ -604,6 +638,10 @@ impl Consensus {
         }
 
         self.state = State::Leader;
+
+        if let Some(l) = LEADER_ID.get() {
+            *l.write().unwrap() = Some(self.id.clone());
+        }
 
         for (peer_id, _) in &self.peers {
             self.next_index.insert(*peer_id, self.logs.len());

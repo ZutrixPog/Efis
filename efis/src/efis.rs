@@ -254,6 +254,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn set(&'static self, req: types::SetReq) -> Result<types::OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Set(req)).await {
@@ -304,6 +305,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn delete(&'static self, req: types::GetReq) -> Result<types::OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Delete(req)).await {
@@ -335,6 +337,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn increment(
         &'static self,
         req: types::GetReq,
@@ -385,6 +388,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn decrement(
         &'static self,
         req: types::GetReq,
@@ -431,6 +435,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn expire(&'static self, req: types::ExpireReq) -> Result<OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Expire(req)).await {
@@ -479,6 +484,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn lpush(&'static self, req: types::ListReq) -> Result<OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Lpush(req)).await {
@@ -517,6 +523,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn rpush(&'static self, req: types::ListReq) -> Result<types::OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Rpush(req)).await {
@@ -554,6 +561,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn lpop(&'static self, req: types::GetReq) -> Result<types::GetRes<String>, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Lpop(req)).await {
@@ -588,6 +596,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn rpop(&'static self, req: types::GetReq) -> Result<types::GetRes<String>, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Rpop(req)).await {
@@ -622,6 +631,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn sadd(&'static self, req: types::ListReq) -> Result<OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Sadd(req)).await {
@@ -682,6 +692,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn zadd(&'static self, req: types::MapReq) -> Result<types::OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Zadd(req)).await {
@@ -750,6 +761,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn publish(&'static self, req: types::PubReq) -> Result<OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::Publish(req)).await {
@@ -786,6 +798,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn vset(&'static self, req: types::VSetReq) -> Result<OkRes, RpcError> {
         // if req.ids.len() != req.vecs.len() {
         //     return Err(RpcError::Internal(anyhow::anyhow!(
@@ -837,6 +850,7 @@ impl Efis {
     }
 
     #[rpc_func]
+    #[requires_leader]
     async fn vdel(&'static self, req: types::VDelReq) -> Result<types::OkRes, RpcError> {
         if self.cons.is_some() {
             match self.handle_consensus(Command::VDel(req)).await {
@@ -869,29 +883,27 @@ impl Efis {
 
     #[rpc_func]
     async fn vsearch(&'static self, req: types::VSearchReq) -> Result<VSearchRes, RpcError> {
-        let res = self
-            .store
-            .store()
-            .get(req.key.as_str())
-            .await
-            .ok_or(anyhow::format_err!("key not found"))
-            .and_then(|value| match value {
-                Value::Vector(index) => {
-                    let res = index
-                        .search(&req.query, req.k, Distance::Cosine)
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .collect();
-                    Ok(res)
-                }
-                _ => Err(anyhow::format_err!("invalid type: expected vector")),
-            });
+        let store = self.store.store();
+        let query = req.query.clone();
+        let k = req.k;
+        let key = req.key.clone();
 
-        if res.is_err() {
-            Err(RpcError::Internal(res.unwrap_err()))
-        } else {
-            Ok(types::VSearchRes { ids: res.unwrap() })
-        }
+        let res = tokio::task::spawn_blocking(move || {
+            let value = store.get_sync(&key).ok_or_else(|| anyhow::format_err!("key not found"))?;
+            match value {
+                Value::Vector(index) => Ok(index
+                    .search(&query, k, Distance::Cosine)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>()),
+                _ => Err(anyhow::format_err!("invalid type: expected vector")),
+            }
+        })
+        .await
+        .map_err(|e| RpcError::Internal(anyhow::format_err!("{e}")))?
+        .map_err(RpcError::Internal)?;
+
+        Ok(types::VSearchRes { ids: res })
     }
 }
 
